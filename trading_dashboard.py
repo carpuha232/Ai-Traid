@@ -12,12 +12,13 @@ from datetime import datetime
 import random
 import sys
 import os
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "modules")))
 
 # Импорты модулей из корня проекта
 try:
-    from core.dashboard_core import DashboardCore
-    from core.dashboard_ui import DashboardUI
-    from core.dashboard_logic import DashboardLogic
+    from core.dashboard.dashboard_core import DashboardCore
+    from core.dashboard.dashboard_ui import DashboardUI
+    from core.dashboard.dashboard_logic import DashboardLogic
     MODULES_AVAILABLE = True
 except ImportError as e:
     print(f"ImportError: {e}")
