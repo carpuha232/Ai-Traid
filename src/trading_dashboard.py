@@ -4,23 +4,25 @@
 Модульная архитектура
 """
 
+import sys
+import os
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
 import tkinter as tk
 from tkinter import ttk, messagebox, scrolledtext
 import threading
 import time
 from datetime import datetime
 import random
-import sys
-import os
-sys.path.append(os.path.join(os.path.dirname(__file__), "trading_bot"))
 
-# Импорты модулей
+# Импорты модулей из корня проекта
 try:
-    from trading_bot.dashboard_core import DashboardCore
-    from trading_bot.dashboard_ui import DashboardUI
-    from trading_bot.dashboard_logic import DashboardLogic
+    from dashboard_core import DashboardCore
+    from dashboard_ui import DashboardUI
+    from dashboard_logic import DashboardLogic
     MODULES_AVAILABLE = True
-except ImportError:
+except ImportError as e:
+    print("ImportError:", e)
     MODULES_AVAILABLE = False
 
 class CompactTradingDashboard:
@@ -53,7 +55,7 @@ class CompactTradingDashboard:
         self.root.geometry("1920x1080")
         
         # Простой интерфейс
-        label = tk.Label(self.root, text="Модули дашборда недоступны\nПроверьте файлы в папке trading_bot/", 
+        label = tk.Label(self.root, text="Модули дашборда недоступны\nПроверьте файлы в корне проекта", 
                         font=("Arial", 16), fg="white", bg="#0f1419")
         label.pack(expand=True)
     
@@ -87,6 +89,11 @@ class CompactTradingDashboard:
 def main():
     """Главная функция"""
     root = tk.Tk()
+    # Определяем размер экрана и открываем окно на весь экран
+    screen_width = root.winfo_screenwidth()
+    screen_height = root.winfo_screenheight()
+    root.geometry(f"{screen_width}x{screen_height}+0+0")
+    root.state('zoomed')  # Для Windows: открыть на весь экран
     app = CompactTradingDashboard(root)
     root.mainloop()
 

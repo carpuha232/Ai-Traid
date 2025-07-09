@@ -12,15 +12,15 @@ from datetime import datetime
 import random
 import sys
 import os
-sys.path.append(os.path.join(os.path.dirname(__file__), "trading_bot"))
 
-# Импорты модулей
+# Импорты модулей из корня проекта
 try:
-    from trading_bot.dashboard_core import DashboardCore
-    from trading_bot.dashboard_ui import DashboardUI
-    from trading_bot.dashboard_logic import DashboardLogic
+    from core.dashboard_core import DashboardCore
+    from core.dashboard_ui import DashboardUI
+    from core.dashboard_logic import DashboardLogic
     MODULES_AVAILABLE = True
-except ImportError:
+except ImportError as e:
+    print(f"ImportError: {e}")
     MODULES_AVAILABLE = False
 
 class CompactTradingDashboard:
@@ -90,7 +90,21 @@ class CompactTradingDashboard:
 def main():
     """Главная функция"""
     root = tk.Tk()
+    
+    # Принудительно отображаем окно на переднем плане
+    root.lift()
+    root.attributes('-topmost', True)
+    root.after_idle(root.attributes, '-topmost', False)
+    
     app = CompactTradingDashboard(root)
+    
+    # Убеждаемся, что окно видимо
+    root.deiconify()
+    root.focus_force()
+    
+    print("🚀 Торговый дашборд запущен!")
+    print("📝 Проверьте, отображается ли окно с терминалом")
+    
     root.mainloop()
 
 if __name__ == "__main__":
