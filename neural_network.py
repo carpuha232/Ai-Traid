@@ -247,22 +247,22 @@ class AutonomousNeuralNetwork:
         current_drawdown = (max_capital - self.current_capital) / max_capital
         self.learning_stats['max_drawdown'] = max(self.learning_stats['max_drawdown'], current_drawdown)
         
-        # Ограничиваем размер памяти
-        if len(self.experience_memory) > 10000:
-            self.experience_memory = self.experience_memory[-5000:]
+        # Ограничиваем размер памяти - УЛУЧШЕННАЯ ВЕРСИЯ
+        if len(self.experience_memory) > 50000:  # Увеличили с 10000 до 50000
+            self.experience_memory = self.experience_memory[-25000:]  # Сохраняем больше
         
-        if len(self.success_patterns) > 1000:
-            self.success_patterns = self.success_patterns[-500:]
+        if len(self.success_patterns) > 2000:  # Увеличили с 1000 до 2000
+            self.success_patterns = self.success_patterns[-1000:]  # Сохраняем больше
         
-        if len(self.failure_patterns) > 1000:
-            self.failure_patterns = self.failure_patterns[-500:]
+        if len(self.failure_patterns) > 2000:  # Увеличили с 1000 до 2000
+            self.failure_patterns = self.failure_patterns[-1000:]  # Сохраняем больше
         
-        # Ограничиваем паттерны
-        if len(self.pattern_learning['successful_conditions']) > 500:
-            self.pattern_learning['successful_conditions'] = self.pattern_learning['successful_conditions'][-250:]
+        # Ограничиваем паттерны - УЛУЧШЕННАЯ ВЕРСИЯ
+        if len(self.pattern_learning['successful_conditions']) > 1000:  # Увеличили с 500 до 1000
+            self.pattern_learning['successful_conditions'] = self.pattern_learning['successful_conditions'][-500:]  # Сохраняем больше
         
-        if len(self.pattern_learning['failure_conditions']) > 500:
-            self.pattern_learning['failure_conditions'] = self.pattern_learning['failure_conditions'][-250:]
+        if len(self.pattern_learning['failure_conditions']) > 1000:  # Увеличили с 500 до 1000
+            self.pattern_learning['failure_conditions'] = self.pattern_learning['failure_conditions'][-500:]  # Сохраняем больше
         
         # Уменьшаем exploration rate
         self.exploration_rate = max(self.min_exploration, self.exploration_rate * self.exploration_decay)
@@ -337,14 +337,14 @@ class AutonomousNeuralNetwork:
         }
     
     def save_state(self, filename: str = 'neural_network_state.json'):
-        """Сохранение состояния нейросети с новыми механизмами"""
+        """Сохранение состояния нейросети с новыми механизмами - УЛУЧШЕННАЯ ВЕРСИЯ"""
         state = {
             'initial_capital': self.initial_capital,
             'current_capital': self.current_capital,
             'learning_rate': self.learning_rate,
-            'experience_memory': self.experience_memory[-1000:],  # Последние 1000 опытов
-            'success_patterns': self.success_patterns[-500:],     # Последние 500 успешных
-            'failure_patterns': self.failure_patterns[-500:],     # Последние 500 неудачных
+            'experience_memory': self.experience_memory[-5000:],  # Последние 5000 опытов (увеличили)
+            'success_patterns': self.success_patterns[-1000:],    # Последние 1000 успешных (увеличили)
+            'failure_patterns': self.failure_patterns[-1000:],    # Последние 1000 неудачных (увеличили)
             'current_cycle': self.current_cycle,
             'total_trades': self.total_trades,
             'profitable_trades': self.profitable_trades,
