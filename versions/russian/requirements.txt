@@ -1,0 +1,26 @@
+# Auto Scalping Bot - Dependencies
+
+# Binance API
+python-binance==1.0.19
+
+# WebSocket для real-time данных
+websockets==12.0
+
+# Асинхронное программирование
+aiohttp==3.9.1
+
+# GUI (Tkinter уже встроен в Python, но на всякий случай)
+# tkinter - встроен в Python
+
+# Для работы со звуком на Windows (встроен в Python)
+# winsound - встроен в Python
+
+# Утилиты
+python-dateutil==2.8.2
+
+# Для AI чата (requests для синхронных запросов)
+requests==2.31.0
+
+# Для тестирования Ollama
+# (requests уже добавлен выше)
+

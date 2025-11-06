@@ -1,0 +1,85 @@
+{
+  "mode": "paper_trading",
+  "auto_trading": true,
+  
+  "api": {
+    "key": "IIfKdT5wVfUSTruQkwlCanIHypwlBetbARRnd37Baf78wC8H5OjaKLMhCogagKps",
+    "secret": "4WTYrX0rT4aHytJKoPSEHjn8wzJ5p2C0QPWFU79SHeg299l8bzPCdQPkmGFiilx1"
+  },
+  
+  "pairs": [
+    "BTCUSDT", "ETHUSDT", "SOLUSDT", "XRPUSDT", "BNBUSDT",
+    "DOGEUSDT", "ADAUSDT", "AVAXUSDT", "TRXUSDT", "LINKUSDT",
+    "MATICUSDT", "DOTUSDT", "UNIUSDT", "LTCUSDT", "BCHUSDT",
+    "ATOMUSDT", "NEARUSDT", "APTUSDT", "FILUSDT", "SUIUSDT"
+  ],
+  
+  "account": {
+    "starting_balance": 500,
+    "leverage": 75,
+    "leverage_min": 50,
+    "leverage_max": 100,
+    "dynamic_leverage": true,
+    "max_positions": 10,
+    "max_position_size_percent": 100
+  },
+  
+  "risk": {
+    "base_risk_percent": 1.0,
+    "use_fibonacci": true,
+    "use_pi_ratio": true,
+    "stop_loss_percent": 0.5,
+    "take_profit_multiplier": 2.0,
+    "trailing_stop": false
+  },
+  
+  "signals": {
+    "min_confidence": 75,
+    "min_confidence_short": 73,
+    "min_imbalance": 0.70,
+    "large_order_threshold": 10000,
+    "tape_window_seconds": 13,
+    "cooldown_seconds": 45,
+    "analysis_mode": "advanced"
+  },
+  
+  "simulation": {
+    "use_realistic_slippage": true,
+    "slippage_percent": 0.015,
+    "commission_maker": 0.02,
+    "commission_taker": 0.04,
+    "use_spread": true,
+    "check_liquidation": true,
+    "simulate_funding": false
+  },
+  
+  "display": {
+    "update_interval": 1.0,
+    "show_live_events": true,
+    "max_events": 15,
+    "compact_mode": false
+  },
+  
+  "alerts": {
+    "sound_on_open": true,
+    "sound_on_close": true,
+    "sound_on_loss": true,
+    "volume": 0.7
+  },
+  
+  "logging": {
+    "log_trades": true,
+    "log_signals": true,
+    "log_events": true,
+    "save_session": true
+  },
+  
+  "local_ai": {
+    "enabled": false,
+    "model_name": "gemma3:4b",
+    "use_sentiment_analysis": true,
+    "use_trade_explanations": true,
+    "use_pattern_analysis": false
+  }
+}
+
