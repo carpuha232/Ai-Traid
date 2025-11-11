@@ -1,0 +1,23 @@
+# Scalping Bot - Dependencies
+# Python 3.10+
+
+# Binance API
+python-binance==1.0.19
+
+# WebSocket для real-time данных
+websockets==12.0
+
+# Асинхронное программирование
+aiohttp==3.9.1
+
+# GUI Framework
+PySide6==6.7.0
+
+# Утилиты
+python-dateutil==2.8.2
+requests==2.31.0
+
+# Для работы с JSON/конфигами (встроено в Python)
+# json, datetime, logging - built-in
+
+# Note: tkinter и winsound встроены в Python

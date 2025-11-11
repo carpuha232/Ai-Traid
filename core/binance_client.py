@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 🔌 BINANCE WEBSOCKET CLIENT
-Подключение к Binance Futures для получения реал-тайм данных
+Realtime access to Binance Futures market data.
 """
 
 import asyncio
@@ -18,71 +18,69 @@ logger = logging.getLogger(__name__)
 
 
 class BinanceRealtimeClient:
-    """
-    Клиент для получения данных в реальном времени через WebSocket
-    """
+    """Realtime WebSocket client for Binance Futures."""
     
     def __init__(self, api_key: str, api_secret: str):
         """
         Args:
-            api_key: Binance API ключ
-            api_secret: Binance API секретный ключ
+            api_key: Binance API key.
+            api_secret: Binance API secret.
         """
         self.api_key = api_key
         self.api_secret = api_secret
         
-        # Синхронный клиент для REST запросов (ленивая инициализация)
+        # Lazy-initialised REST client
         self.client = None
         
-        # Хранилища данных
+        # Data stores
         self.orderbooks: Dict[str, Dict] = {}
         self.trades: Dict[str, deque] = {}
         self.prices: Dict[str, float] = {}
-        self.price_ts: Dict[str, float] = {}  # unix time последнего обновления цены
+        self.price_ts: Dict[str, float] = {}  # unix ts of the latest price update
         self.book_ticker: Dict[str, Dict[str, float]] = {}  # {'bid': float, 'ask': float, 'ts': float}
-        # Состояние синхронизации стакана: bids/asks dict + lastUpdateId
+        # Order book sync state: bids/asks dict + lastUpdateId
         self.book_state: Dict[str, Dict] = {}
-        # Троттлинг ресинка
+        # Resync throttling
         self._last_resync_ts: Dict[str, float] = {}
         self._resync_attempts: Dict[str, int] = {}
         
-        # Callback функции
+        # Callback registries
         self.orderbook_callbacks: List[Callable] = []
         self.trade_callbacks: List[Callable] = []
         self.price_callbacks: List[Callable] = []
         
-        # Состояние
+        # Runtime state
         self.running = False
         self.tasks = []
         self.session = None  # aiohttp session
         
-        logger.info("🔌 Binance WebSocket клиент инициализирован")
+        logger.info("🔌 Binance WebSocket client initialised")
     
     async def start_streams(self, symbols: List[str]):
         """
-        Запуск WebSocket стримов для списка символов
-        
+        Launch WebSocket streams for provided symbols.
+
         Args:
-            symbols: Список торговых пар (например: ['ETHUSDT', 'BTCUSDT'])
+            symbols: List of trading pairs (e.g. ['ETHUSDT', 'BTCUSDT']).
         """
         self.running = True
         
-        # Создаем aiohttp session для асинхронных HTTP запросов
+        # Create aiohttp session for async HTTP requests
         if self.session is None:
             self.session = aiohttp.ClientSession()
         
-        # Инициализируем хранилища для каждого символа
+        # Initialise state for each symbol
         for symbol in symbols:
             self.orderbooks[symbol] = {'bids': [], 'asks': [], 'timestamp': 0}
-            self.trades[symbol] = deque(maxlen=100)  # Последние 100 сделок
+            self.trades[symbol] = deque(maxlen=100)  # Last 100 trades
             self.prices[symbol] = 0.0
             self.price_ts[symbol] = 0.0
             self.book_state[symbol] = {'bids': {}, 'asks': {}, 'lastUpdateId': None, 'synced': False}
             self._last_resync_ts[symbol] = 0.0
             self._resync_attempts[symbol] = 0
-            # Снапшот стакана (UM Futures)
+            # Capture order book snapshot (UM Futures)
             try:
-                # Используем прямой REST UM Futures endpoint вместо client.futures_depth
+                # Use the direct REST UM Futures endpoint instead of client.futures_depth
                 async with self.session.get(
                     "https://fapi.binance.com/fapi/v1/depth",
                     params={"symbol": symbol, "limit": 1000},
@@ -99,32 +97,33 @@ class BinanceRealtimeClient:
                         'lastUpdateId': last_id,
                         'synced': True
                     }
-                    # Сформируем топ-20
+                    # Precompute top 20 levels
                     top_bids = [[p, bids[p]] for p in sorted(bids.keys(), reverse=True)[:20]]
                     top_asks = [[p, asks[p]] for p in sorted(asks.keys())[:20]]
                     self.orderbooks[symbol] = {'bids': top_bids, 'asks': top_asks, 'timestamp': 0}
             except Exception as e:
-                logger.error(f"❌ Ошибка получения snapshot depth для {symbol}: {e}")
+                logger.error(f"❌ Snapshot depth fetch failed for {symbol}: {e}")
         
-        # Запускаем стримы
+        # Launch streams
         for symbol in symbols:
-            # Depth stream (стакан)
+            # Depth stream (order book)
             depth_task = asyncio.create_task(self._depth_stream(symbol))
             self.tasks.append(depth_task)
             
-            # Trade stream (лента сделок)
+            # Trade stream (trade feed)
             trade_task = asyncio.create_task(self._trade_stream(symbol))
             self.tasks.append(trade_task)
             
-            # BookTicker (best bid/ask) — для отображения актуального спреда
+            # BookTicker (best bid/ask) — to monitor live spread
             bt_task = asyncio.create_task(self._book_ticker_stream(symbol))
             self.tasks.append(bt_task)
         
-        logger.info(f"🚀 Запущено {len(self.tasks)} WebSocket стримов для {len(symbols)} пар")
+        logger.info(f"🚀 Started {len(self.tasks)} WebSocket streams for {len(symbols)} pairs")
     
     def _futures_stream_url(self, stream_type: str, symbol_lower: str) -> str:
-        """Построить URL для UM Futures WebSocket (fstream).
-        stream_type: 'depth'|'aggtrade'|'bookticker'
+        """Build the UM Futures WebSocket URL.
+
+        stream_type: 'depth' | 'aggtrade' | 'bookticker'
         """
         if stream_type == 'depth':
             # Partial depth 20 levels, 100ms
@@ -136,7 +135,7 @@ class BinanceRealtimeClient:
         raise ValueError(f"Unknown stream_type: {stream_type}")
 
     async def _depth_stream(self, symbol: str):
-        """WebSocket стрим для стакана ордеров"""
+        """Order book WebSocket stream."""
         symbol_lower = symbol.lower()
         url = self._futures_stream_url('depth', symbol_lower)
         while self.running:
@@ -155,22 +154,22 @@ class BinanceRealtimeClient:
                             u = payload.get('u')  # final update ID in event
                             pu = payload.get('pu')  # previous final update ID
                             last_id = state.get('lastUpdateId') or 0
-                            # Валидация последовательности
+                            # Sequence validation
                             if pu is not None and last_id is not None and pu != last_id:
                                 raise ValueError(f"sequence gap: pu={pu}, last={last_id}")
                             if u is not None and last_id is not None and u < last_id:
-                                continue  # старое событие
+                                continue  # stale event
                         except Exception as e:
                             now_ts = time()
-                            # Троттлим ресинки: не чаще раза в 2с и не более 5 подряд
+                            # Throttle resyncs: max once every 2s and max 5 attempts
                             if now_ts - self._last_resync_ts.get(symbol, 0.0) < 2.0 or self._resync_attempts.get(symbol, 0) >= 5:
-                                # Помечаем как не синхронизированное, но не блокируем поток
+                                # Mark as unsynced, keep stream alive
                                 state['synced'] = False
                                 continue
-                            logger.warning(f"⚠️ Предупреждение последовательности глубины {symbol}: {e}, ресинк")
+                            logger.warning(f"⚠️ Depth sequence warning {symbol}: {e}, resyncing")
                             try:
                                 if self.session is None:
-                                    logger.error(f"❌ Сессия не инициализирована для {symbol}")
+                                    logger.error(f"❌ Session not initialised for {symbol}")
                                     state['synced'] = False
                                     await asyncio.sleep(1)
                                     continue
@@ -185,19 +184,19 @@ class BinanceRealtimeClient:
                                     bids = {float(p): float(q) for p, q in snapshot.get('bids', [])}
                                     asks = {float(p): float(q) for p, q in snapshot.get('asks', [])}
                                     self.book_state[symbol] = {'bids': bids, 'asks': asks, 'lastUpdateId': last_id, 'synced': True}
-                                    # Обновим top20 для визуализации
+                                    # Refresh top-20 for UI
                                     top_bids = [[p, bids[p]] for p in sorted(bids.keys(), reverse=True)[:20]]
                                     top_asks = [[p, asks[p]] for p in sorted(asks.keys())[:20]]
                                     self.orderbooks[symbol] = {'bids': top_bids, 'asks': top_asks, 'timestamp': 0}
                                     self._last_resync_ts[symbol] = now_ts
                                     self._resync_attempts[symbol] = 0
-                                    logger.info(f"✅ Ресинк успешен {symbol}")
+                                    logger.info(f"✅ Resync completed for {symbol}")
                             except Exception as ee:
                                 self._resync_attempts[symbol] = self._resync_attempts.get(symbol, 0) + 1
-                                logger.error(f"❌ Ресинк не удался {symbol} ({self._resync_attempts[symbol]}): {ee}")
+                                logger.error(f"❌ Resync failed for {symbol} ({self._resync_attempts[symbol]}): {ee}")
                                 state['synced'] = False
                                 continue
-                        # Применяем диффы
+                        # Apply deltas
                         bids_map = state['bids']
                         asks_map = state['asks']
                         for p, q in payload['b']:
@@ -213,12 +212,12 @@ class BinanceRealtimeClient:
                             else:
                                 asks_map[price] = qty
                         state['lastUpdateId'] = payload.get('u', state.get('lastUpdateId'))
-                        # Пересобираем топ-20
+                        # Rebuild top-20
                         top_bids = [[p, bids_map[p]] for p in sorted(bids_map.keys(), reverse=True)[:20]]
                         top_asks = [[p, asks_map[p]] for p in sorted(asks_map.keys())[:20]]
                         ob = {'bids': top_bids, 'asks': top_asks, 'timestamp': payload.get('E') or payload.get('T') or 0}
                         self.orderbooks[symbol] = ob
-                        # Обновим mid для отображения
+                        # Update mid price
                         if top_bids and top_asks:
                             best_bid = top_bids[0][0]
                             best_ask = top_asks[0][0]
@@ -230,13 +229,13 @@ class BinanceRealtimeClient:
                             try:
                                 await callback(symbol, ob)
                             except Exception as e:
-                                logger.error(f"Ошибка в orderbook callback: {e}")
+                                logger.error(f"Orderbook callback error: {e}")
             except Exception as e:
-                logger.error(f"❌ Ошибка в depth stream для {symbol}: {e}")
+                logger.error(f"❌ Depth stream error for {symbol}: {e}")
                 await asyncio.sleep(0.5)
     
     async def _trade_stream(self, symbol: str):
-        """WebSocket стрим для ленты сделок"""
+        """Trade tape WebSocket stream."""
         symbol_lower = symbol.lower()
         url = self._futures_stream_url('aggtrade', symbol_lower)
         while self.running:
@@ -269,13 +268,13 @@ class BinanceRealtimeClient:
                             try:
                                 await callback(symbol, trade)
                             except Exception as e:
-                                logger.error(f"Ошибка в trade callback: {e}")
+                                logger.error(f"Trade callback error: {e}")
             except Exception as e:
-                logger.error(f"❌ Ошибка в trade stream для {symbol}: {e}")
+                logger.error(f"❌ Trade stream error for {symbol}: {e}")
                 await asyncio.sleep(0.5)
 
     async def _book_ticker_stream(self, symbol: str):
-        """UM Futures лучший bid/ask поток (bookTicker)"""
+        """UM Futures best bid/ask stream (bookTicker)."""
         symbol_lower = symbol.lower()
         url = self._futures_stream_url('bookticker', symbol_lower)
         while self.running:
@@ -296,36 +295,36 @@ class BinanceRealtimeClient:
                             continue
                         self.book_ticker[symbol] = {'bid': best_bid, 'ask': best_ask, 'ts': ts_val}
             except Exception as e:
-                logger.error(f"❌ Ошибка в bookTicker stream для {symbol}: {e}")
+                logger.error(f"❌ BookTicker stream error for {symbol}: {e}")
                 await asyncio.sleep(0.5)
     
     def get_orderbook(self, symbol: str) -> Dict:
-        """Получить текущий стакан ордеров"""
+        """Return the current order book snapshot."""
         return self.orderbooks.get(symbol, {'bids': [], 'asks': [], 'timestamp': 0})
     
     def get_recent_trades(self, symbol: str, count: int = 50, window_seconds: float = 20.0) -> List[Dict]:
         """
-        Получить последние сделки за указанное окно времени
-        
+        Get recent trades for a symbol within a time window.
+
         Args:
-            symbol: Торговая пара
-            count: Максимальное количество сделок
-            window_seconds: Окно времени в секундах (по умолчанию 20 секунд)
-        
+            symbol: Trading pair.
+            count: Maximum number of trades to return.
+            window_seconds: Time window in seconds (default 20 seconds).
+
         Returns:
-            Список сделок за последние window_seconds секунд
+            List of trades within the last ``window_seconds`` seconds.
         """
         trades = list(self.trades.get(symbol, []))
         if not trades:
             return []
         
-        # Фильтруем сделки по времени (за последние window_seconds секунд)
+        # Filter trades by age within window_seconds
         now = time()
         recent_trades = []
-        for trade in reversed(trades):  # Идем с конца (самые свежие сначала)
-            trade_time = trade.get('time', 0) / 1000.0  # Конвертируем из ms в секунды
+        for trade in reversed(trades):  # Start with newest
+            trade_time = trade.get('time', 0) / 1000.0  # Convert from ms to seconds
             if now - trade_time <= window_seconds:
-                recent_trades.insert(0, trade)  # Вставляем в начало для сохранения порядка
+                recent_trades.insert(0, trade)  # Maintain chronological order
                 if len(recent_trades) >= count:
                     break
         
@@ -333,18 +332,19 @@ class BinanceRealtimeClient:
     
     def get_current_price(self, symbol: str) -> float:
         """
-        Возвращает АКТУАЛЬНУЮ цену.
-        - Источник: лента сделок (приоритет) или mid-price стакана как резерв.
-        - Фильтр свежести: если последняя цена из сделок старше 3 секунд — используем mid из фьючерсного стакана,
-          иначе 0.0. Никаких REST фоллбеков.
+        Return the most recent price.
+
+        Priority source: trade tape price, with order-book mid-price fallback.
+        Freshness filter: if trade price is older than 3 seconds, use mid-price;
+        otherwise return 0.0. No REST fallback.
         """
         price = self.prices.get(symbol, 0.0)
         last_ts = self.price_ts.get(symbol, 0.0)
         now = time()
-        # Если цена из ленты свежая — используем её
+        # If trade price is fresh, use it
         if price > 0 and now - last_ts <= 3.0:
             return price
-        # Иначе пробуем свежий bookTicker (best bid/ask) и возвращаем mid
+        # Otherwise use bookTicker mid
         bt = self.book_ticker.get(symbol)
         if bt and bt.get('bid') and bt.get('ask'):
             bid = bt['bid']
@@ -352,45 +352,45 @@ class BinanceRealtimeClient:
             mid = (bid + ask) / 2
             if mid > 0:
                 return mid
-        # Нет свежих данных — возвращаем 0.0 (лучше пропустить шаг, чем использовать сомнительную цену)
+        # No fresh data available
         return 0.0
 
     def is_symbol_ready(self, symbol: str, min_trades: int = 5, max_trade_age_sec: float = 3.0) -> bool:
-        """Готов ли символ к торговле: есть синхронизированный стакан, свежая цена и достаточно принтов."""
-        # Стакан синхронизирован
+        """Is a symbol ready for trading (synced order book, fresh price, sufficient prints)."""
+        # Order book synced
         state = self.book_state.get(symbol)
         if not state or not state.get('synced'):
             return False
-        # Достаточно принтов
+        # Enough trades
         if len(self.trades.get(symbol, [])) < min_trades:
             return False
-        # Свежая цена из принтов
+        # Fresh trade price
         now_ts = time()
         if now_ts - self.price_ts.get(symbol, 0.0) > max_trade_age_sec:
             return False
-        # Есть актуальный bookTicker для контроля спреда
+        # Valid bookTicker for spread control
         bt = self.book_ticker.get(symbol)
         if not bt or bt.get('bid', 0.0) <= 0 or bt.get('ask', 0.0) <= 0:
             return False
         return True
 
     def are_all_ready(self, symbols: List[str], min_trades: int = 5, max_trade_age_sec: float = 3.0) -> bool:
-        """Все ли символы готовы к началу торговли."""
+        """Check whether all symbols are ready to trade."""
         for s in symbols:
             if not self.is_symbol_ready(s, min_trades=min_trades, max_trade_age_sec=max_trade_age_sec):
                 return False
         return True
     
     def get_account_balance(self) -> float:
-        """Получить баланс аккаунта (Futures)"""
+        """Fetch futures account balance."""
         try:
-            # Ленивая инициализация клиента
+            # Lazy client initialisation
             if self.client is None:
                 self.client = Client(self.api_key, self.api_secret)
             
             account = self.client.futures_account()
             
-            # Ищем USDT баланс
+            # Extract USDT balance
             for asset in account['assets']:
                 if asset['asset'] == 'USDT':
                     return float(asset['walletBalance'])
@@ -398,36 +398,36 @@ class BinanceRealtimeClient:
             return 0.0
             
         except Exception as e:
-            logger.error(f"❌ Ошибка получения баланса: {e}")
+            logger.error(f"❌ Failed to fetch account balance: {e}")
             return 0.0
     
     def register_orderbook_callback(self, callback: Callable):
-        """Регистрация callback для обновлений стакана"""
+        """Register order book update callback."""
         self.orderbook_callbacks.append(callback)
     
     def register_trade_callback(self, callback: Callable):
-        """Регистрация callback для обновлений ленты сделок"""
+        """Register trade feed update callback."""
         self.trade_callbacks.append(callback)
     
     async def stop(self):
-        """Остановка всех стримов"""
+        """Stop every running stream."""
         self.running = False
         
-        # Отменяем все задачи
+        # Cancel outstanding tasks
         for task in self.tasks:
             task.cancel()
         
-        # Ждем завершения
+        # Await completion
         await asyncio.gather(*self.tasks, return_exceptions=True)
         
-        # Закрываем aiohttp session
+        # Close aiohttp session
         if self.session:
             await self.session.close()
         
-        logger.info("⏹️ WebSocket стримы остановлены")
+        logger.info("⏹️ WebSocket streams stopped")
 
 
-# Простой тест
+# Quick manual test
 if __name__ == "__main__":
     import sys
     
@@ -437,17 +437,17 @@ if __name__ == "__main__":
     )
     
     async def test_client():
-        # Тестовые ключи (замени на свои)
+        # Demo keys (replace with your own)
         API_KEY = "your_api_key"
         API_SECRET = "your_api_secret"
         
         if API_KEY == "your_api_key":
-            print("❌ Замени API_KEY и API_SECRET на свои ключи!")
+            print("❌ Replace API_KEY and API_SECRET with your own credentials!")
             return
         
         client = BinanceRealtimeClient(API_KEY, API_SECRET)
         
-        # Callback для отображения стакана
+        # Order book display callback
         async def on_orderbook_update(symbol: str, orderbook: Dict):
             best_bid = orderbook['bids'][0] if orderbook['bids'] else [0, 0]
             best_ask = orderbook['asks'][0] if orderbook['asks'] else [0, 0]
@@ -455,13 +455,13 @@ if __name__ == "__main__":
         
         client.register_orderbook_callback(on_orderbook_update)
         
-        # Запускаем стримы
+        # Start streams
         await client.start_streams(['ETHUSDT', 'BTCUSDT'])
         
-        # Работаем 30 секунд
+        # Keep running for 30 seconds
         await asyncio.sleep(30)
         
-        # Останавливаем
+        # Stop
         await client.stop()
     
     asyncio.run(test_client())

@@ -58,76 +58,36 @@ class SignalAnalyzer:
         self.min_imbalance = config['signals']['min_imbalance']
         self.large_order_threshold = config['signals']['large_order_threshold']
         self.tape_window = config['signals']['tape_window_seconds']
-        
+
         # История сигналов по паре (для cooldown)
         self.last_signal_time: Dict[str, datetime] = {}
         self.cooldown_seconds = config['signals']['cooldown_seconds']
+        self.strictness_percent = 50.0
+        self.prob_threshold_long = 0.55
+        self.prob_threshold_short = 0.53
         
-        # Адаптивные веса факторов (динамически меняются на основе производительности)
-        self.factor_weights = {
-            'wall': 0.35,
-            'spread': 0.25,
-            'imbalance': 0.20,
-            'aggression': 0.10,
-            'momentum': 0.05,
-            'fib': 0.05
-        }
-        
-        # Режим торговли (устанавливается из main_v3)
-        self.trading_mode = "Умеренная"  # По умолчанию
-        
-        # Статистика производительности факторов
-        self.factor_performance = {
-            'wall': {'wins': 0, 'total': 0},
-            'spread': {'wins': 0, 'total': 0},
-            'imbalance': {'wins': 0, 'total': 0},
-            'aggression': {'wins': 0, 'total': 0},
-            'momentum': {'wins': 0, 'total': 0},
-            'fib': {'wins': 0, 'total': 0}
-        }
-        
-        logger.info("📊 Анализатор сигналов инициализирован (теория вероятности включена)")
+        logger.info("📊 Анализатор сигналов инициализирован (вероятностная модель активна)")
     
     def set_trading_mode(self, mode: str):
-        """Установить режим торговли и изменить веса индикаторов
-        
-        Args:
-            mode: "Консервативная", "Умеренная" или "Агрессивная"
-        """
         self.trading_mode = mode
-        
-        if mode == "Консервативная":
-            # Все 6 индикаторов с полными весами
-            self.factor_weights = {
-                'wall': 0.35,
-                'spread': 0.25,
-                'imbalance': 0.20,
-                'aggression': 0.10,
-                'momentum': 0.05,
-                'fib': 0.05
-            }
-        elif mode == "Умеренная":
-            # Несколько важных индикаторов (wall, spread, imbalance)
-            self.factor_weights = {
-                'wall': 0.50,      # Увеличен
-                'spread': 0.30,    # Увеличен
-                'imbalance': 0.20,  # Сохранен
-                'aggression': 0.0, # Отключен
-                'momentum': 0.0,   # Отключен
-                'fib': 0.0         # Отключен
-            }
-        else:  # Агрессивная
-            # Минимум индикаторов (только wall и spread)
-            self.factor_weights = {
-                'wall': 0.60,      # Максимальный вес
-                'spread': 0.40,    # Максимальный вес
-                'imbalance': 0.0,  # Отключен
-                'aggression': 0.0, # Отключен
-                'momentum': 0.0,   # Отключен
-                'fib': 0.0         # Отключен
-            }
-        
-        logger.debug(f"📊 Режим торговли: {mode}, веса индикаторов обновлены")
+        mapping = {
+            "Консервативная": 30.0,
+            "Умеренная": 50.0,
+            "Агрессивная": 80.0
+        }
+        self.strictness_percent = mapping.get(mode, 50.0)
+        self._update_prob_thresholds()
+        logger.debug(f"📊 Режим торговли: {mode} ({self.strictness_percent:.1f}%)")
+
+    def set_strictness(self, value: float):
+        self.strictness_percent = max(1.0, min(100.0, value))
+        self._update_prob_thresholds()
+
+    def _update_prob_thresholds(self):
+        # Привязка порога к жесткости: 10% → ~0.50, 50% → ~0.57, 80% → ~0.62, 100% → ~0.66
+        base = 0.48 + (self.strictness_percent / 100.0) * 0.18
+        self.prob_threshold_long = min(0.70, max(0.50, base))
+        self.prob_threshold_short = min(0.68, max(0.48, self.prob_threshold_long - 0.01))
     
     def analyze(self, symbol: str, orderbook: Dict, recent_trades: List[Dict]) -> TradingSignal:
         """
@@ -175,40 +135,36 @@ class SignalAnalyzer:
         # 6. Momentum (изменение цены vs объем)
         momentum_score, reasons_momentum = self._analyze_momentum(recent_trades)
         
-        # --- РАСЧЕТ ОБЩЕЙ УВЕРЕННОСТИ ---
-        
-        # Формула уверенности (6 факторов) с адаптивными весами:
-        # Wall War + Spread Tightness + Imbalance + Aggression + Momentum + Fibonacci
-        # Веса динамически адаптируются на основе производительности факторов
-        confidence = 0
-        # V3: Расчет уверенности с учетом режима торговли
-        confidence += wall_score * self.factor_weights['wall']
-        confidence += spread_score * self.factor_weights['spread']
-        if self.factor_weights['imbalance'] > 0:
-            confidence += imbalance_score * self.factor_weights['imbalance']
-        if self.factor_weights['aggression'] > 0:
-            confidence += aggression_score * self.factor_weights['aggression']
-        if self.factor_weights['momentum'] > 0:
-            confidence += momentum_score * self.factor_weights['momentum']
-        if self.factor_weights['fib'] > 0:
-            confidence += fib_score * self.factor_weights['fib']
-        
-        # БОНУСЫ: повышаем уверенность при сильных комбинациях
-        # Бонус 1: wall ≥75 и spread ≥80 → +25%
-        if wall_score >= 75 and spread_score >= 80:
-            confidence *= 1.25  # +25% если оба показателя сильны
-        # Бонус 2: imbalance ≥80 и aggression ≥70 → +15%
-        if imbalance_score >= 80 and aggression_score >= 70:
-            confidence *= 1.15  # +15% если дисбаланс + агрессия
-        
-        confidence = min(confidence, 95.0)  # Максимум 95%
-        
-        # Определяем направление - СИММЕТРИЧНАЯ ЛОГИКА для LONG и SHORT
-        # Используем отклонение от нейтрального уровня (50)
-        
+        support_price, resistance_price = self._find_probability_levels(orderbook, current_price)
+
+        strictness = getattr(self, 'strictness_percent', 50.0)
+        strictness = max(1.0, min(100.0, strictness))
+
+        sigma = self._estimate_volatility(recent_trades, current_price)
+        horizon = self._estimate_horizon(recent_trades)
+
+        sigma *= (1.0 + (strictness - 50.0) / 200.0)
+        horizon *= (1.0 - (strictness - 50.0) / 250.0)
+
+        base_prob_up = self._probability_to_level(resistance_price - current_price, sigma, horizon, current_price)
+        base_prob_down = self._probability_to_level(current_price - support_price, sigma, horizon, current_price)
+
+        if wall_score < 55 or spread_score < 55:
+            return self._wait_signal(symbol, "Недостаточно ликвидности")
+
         bullish_strength = 0
         bearish_strength = 0
-        
+
+        key_conditions = 0
+        if wall_score >= 65 and spread_score >= 60:
+            key_conditions += 1
+        if imbalance_score >= 60:
+            key_conditions += 1
+        if aggression_score >= 60:
+            key_conditions += 1
+        if momentum_score >= 60:
+            key_conditions += 1
+
         # Дисбаланс (симметрично: 70% bid = 70% ask по силе)
         if bid_percent >= 0.70:
             bullish_strength += 3
@@ -254,33 +210,36 @@ class SignalAnalyzer:
         if wall_score <= 35:  # Симметрично!
             bearish_strength += 1
         
-        # Определяем направление по симметричной силе
-        min_conf_long = self.min_confidence  # LONG: ≥68%
-        min_conf_short = self.config['signals'].get('min_confidence_short', 66)  # SHORT: ≥66%
-        
-        # Логируем для отладки
-        logger.debug(f"{symbol}: bullish={bullish_strength}, bearish={bearish_strength}, conf={confidence:.1f}%")
-        
-        # Пороги входа:
-        # LONG: confidence ≥68% и bullish_strength > bearish_strength
-        # SHORT: confidence ≥66% и bearish_strength > bullish_strength
-        if confidence >= min_conf_long and bullish_strength > bearish_strength:
+        adjust_long = min(1.2, 0.8 + bullish_strength * 0.05)
+        adjust_short = min(1.2, 0.8 + bearish_strength * 0.05)
+        prob_up = min(0.99, max(0.0, base_prob_up * adjust_long))
+        prob_down = min(0.99, max(0.0, base_prob_down * adjust_short))
+
+        logger.debug(
+            f"{symbol}: prob_up={prob_up:.2f}, prob_down={prob_down:.2f}, bull={bullish_strength}, bear={bearish_strength}"
+        )
+
+        threshold_long = getattr(self, 'prob_threshold_long', self.min_confidence / 100.0)
+        threshold_short = getattr(self, 'prob_threshold_short', self.config['signals'].get('min_confidence_short', 66) / 100.0)
+
+        if prob_up >= threshold_long and prob_up > prob_down and bullish_strength > bearish_strength and key_conditions >= 2:
             direction = 'LONG'
-        elif confidence >= min_conf_short and bearish_strength > bullish_strength:
+            confidence = prob_up * 100.0
+        elif prob_down >= threshold_short and prob_down > prob_up and bearish_strength > bullish_strength and key_conditions >= 2:
             direction = 'SHORT'
+            confidence = prob_down * 100.0
         else:
-            direction = 'WAIT'
-        
-        # ТЕОРИЯ ВЕРОЯТНОСТИ: ОТКЛЮЧЕНА для V1 совместимости
-        # Байес и EV могут блокировать сделки, как в оригинальной V1 их не было
-        
-        confidence = min(confidence, 95.0)  # Максимум 95%
+            return self._wait_signal(symbol, f"P(up)={prob_up:.2f}, P(down)={prob_down:.2f}")
+
+        confidence = min(confidence, 99.0)
         
         # Устанавливаем expected_value = 0 (для обратной совместимости с логированием)
         expected_value = 0.0
         
         # Собираем все причины
         all_reasons = reasons_imbalance + reasons_walls + reasons_aggression + reasons_fib + reasons_spread + reasons_momentum
+        all_reasons.append(f"Support={support_price:.4f}, Resistance={resistance_price:.4f}")
+        all_reasons.append(f"P↑={prob_up:.2f}, P↓={prob_down:.2f}")
         
         # Если WAIT - возвращаем сразу
         if direction == 'WAIT':
@@ -289,10 +248,9 @@ class SignalAnalyzer:
         # --- РАСЧЕТ УРОВНЕЙ (риск-менеджмент) ---
         
         # РИСК-МЕНЕДЖМЕНТ:
-        # Стоп-лосс: -0.5% от входа
-        # Тейк-профит: +1.0% от входа (риск:прибыль = 1:2)
-        stop_distance_percent = self.config['risk']['stop_loss_percent']  # 0.5%
-        take_profit_percent = stop_distance_percent * self.config['risk']['take_profit_multiplier']  # 0.5% × 2.0 = 1.0%
+        # Стоп-лосс и тейк-профит задаются из конфигурации (например 0.8% и 1:2.5)
+        stop_distance_percent = self.config['risk']['stop_loss_percent']
+        take_profit_percent = stop_distance_percent * self.config['risk']['take_profit_multiplier']
         
         if direction == 'LONG':
             entry_price = best_ask  # Входим по Ask
@@ -668,6 +626,89 @@ class SignalAnalyzer:
         
         return score, reasons
     
+    def _find_probability_levels(self, orderbook: Dict, current_price: float) -> Tuple[float, float]:
+        bids = orderbook.get('bids', [])
+        asks = orderbook.get('asks', [])
+
+        support_price = current_price * 0.999
+        resistance_price = current_price * 1.001
+
+        if bids:
+            max_bid_volume = max(q for _, q in bids)
+            candidates = []
+            for price, qty in bids[:100]:
+                if price > current_price:
+                    continue
+                ratio = qty / max_bid_volume if max_bid_volume else 0
+                for fib in FIB_LEVELS:
+                    if abs(ratio - fib) <= 0.08:
+                        candidates.append((current_price - price, price))
+                        break
+            if candidates:
+                support_price = min(candidates)[1]
+            else:
+                support_price = bids[0][0]
+
+        if asks:
+            max_ask_volume = max(q for _, q in asks)
+            candidates = []
+            for price, qty in asks[:100]:
+                if price < current_price:
+                    continue
+                ratio = qty / max_ask_volume if max_ask_volume else 0
+                for fib in FIB_LEVELS:
+                    if abs(ratio - fib) <= 0.08:
+                        candidates.append((price - current_price, price))
+                        break
+            if candidates:
+                resistance_price = min(candidates)[1]
+            else:
+                resistance_price = asks[0][0]
+
+        support_price = max(support_price, current_price * 0.95)
+        resistance_price = min(resistance_price, current_price * 1.05)
+
+        return support_price, resistance_price
+
+    def _estimate_volatility(self, recent_trades: List[Dict], current_price: float) -> float:
+        if not recent_trades:
+            return current_price * 0.0008
+
+        prices = [t.get('price') for t in recent_trades[-50:] if t.get('price')]
+        if len(prices) < 2:
+            return current_price * 0.0008
+
+        diffs = [abs(prices[i] - prices[i - 1]) for i in range(1, len(prices))]
+        if not diffs:
+            return current_price * 0.0008
+
+        avg = sum(diffs) / len(diffs)
+        variance = sum((d - avg) ** 2 for d in diffs) / len(diffs)
+        sigma = math.sqrt(max(variance, 1e-12))
+
+        return max(sigma, current_price * 0.0005)
+
+    def _estimate_horizon(self, recent_trades: List[Dict]) -> float:
+        if len(recent_trades) < 2:
+            return 30.0
+        times = [t.get('time', 0) for t in recent_trades if t.get('time')]
+        if len(times) < 2:
+            return 30.0
+        horizon = (max(times) - min(times)) / 1000.0
+        return max(horizon, 30.0)
+
+    def _probability_to_level(self, delta: float, sigma: float, horizon: float, current_price: float) -> float:
+        if delta <= 0:
+            return 0.5
+        denom = max(sigma, current_price * 0.0005) * math.sqrt(max(horizon, 1.0))
+        if denom <= 0:
+            denom = current_price * 0.0005
+        z = delta / denom
+        return self._normal_cdf(z)
+
+    def _normal_cdf(self, x: float) -> float:
+        return 0.5 * (1.0 + math.erf(x / math.sqrt(2.0)))
+
     def _apply_bayesian_update(self, symbol: str, direction: str, prior_confidence: float) -> float:
         """
         БАЙЕСОВСКОЕ ОБНОВЛЕНИЕ уверенности на основе исторического win rate

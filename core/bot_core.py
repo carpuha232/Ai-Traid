@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 """
-🤖 BOT CORE - Основная логика бота
-Вынесено из main.py для реструктуризации
+🤖 BOT CORE - main trading logic extracted from main.py for modularity.
 """
 
 import asyncio
@@ -15,27 +14,27 @@ logger = logging.getLogger(__name__)
 
 
 class BotCore:
-    """Основная логика бота - вынесена из main.py"""
+    """Primary bot logic extracted from main.py."""
     
     def __init__(self, bot_instance):
-        """Инициализация с ссылкой на основной класс бота"""
+        """Initialise with a reference to the main bot instance."""
         self.bot = bot_instance
     
     def _get_strictness_params(self):
-        """Получить параметры анализа на основе текущей жесткости (три режима)"""
-        if self.bot.strictness_percent <= 25:  # КОНСЕРВАТИВНАЯ
+        """Return analysis parameters for current strictness (three modes)."""
+        if self.bot.strictness_percent <= 25:  # Conservative
             return {
                 'min_confidence': 95.0,
                 'min_trades': 2,
                 'max_price_diff': 0.001
             }
-        elif self.bot.strictness_percent <= 75:  # УМЕРЕННАЯ
+        elif self.bot.strictness_percent <= 75:  # Moderate
             return {
                 'min_confidence': 50.0,
                 'min_trades': 6,
                 'max_price_diff': 0.002
             }
-        else:  # АГРЕССИВНАЯ
+        else:  # Aggressive
             return {
                 'min_confidence': 30.0,
                 'min_trades': 12,
@@ -43,26 +42,26 @@ class BotCore:
             }
     
     def _calculate_trades_required(self, signal, strictness_params):
-        """Рассчитать требуемое количество сделок в зависимости от режима"""
+        """Determine the number of trades required for the given mode."""
         min_trades_required = strictness_params['min_trades']
         
-        if self.bot.strictness_percent > 75:  # Агрессивная
+        if self.bot.strictness_percent > 75:  # Aggressive
             if signal.confidence >= 90:
                 return max(10, min_trades_required - 2)
             elif signal.confidence >= 80:
                 return max(10, min_trades_required - 1)
             return min_trades_required
-        elif self.bot.strictness_percent > 25:  # Умеренная
+        elif self.bot.strictness_percent > 25:  # Moderate
             if signal.confidence >= 90:
                 return 5
             elif signal.confidence >= 80:
                 return max(5, min_trades_required - 1)
             return min_trades_required
         
-        return min_trades_required  # Консервативная
+        return min_trades_required  # Conservative
     
     async def _update_positions(self):
-        """Обновление открытых позиций"""
+        """Update open positions."""
         for symbol in list(self.bot.paper_trader.positions.keys()):
             try:
                 current_price = self.bot.binance_client.get_current_price(symbol)
@@ -71,13 +70,10 @@ class BotCore:
                     if closed_trade:
                         self._handle_closed_trade(closed_trade)
             except Exception as e:
-                logger.error(f"Ошибка обновления позиции {symbol}: {e}")
+                logger.error(f"Failed to update position {symbol}: {e}")
     
     def _handle_closed_trade(self, closed_trade):
-        """Обработка закрытой сделки"""
-        self.bot.learning.learn_from_trade(closed_trade)
-        
-        # Обновляем производительность факторов
+        """Handle closed trade bookkeeping."""
         signal = self.bot.current_signals.get(closed_trade.symbol)
         if signal and hasattr(signal, 'direction') and signal.direction != 'WAIT':
             factors = {
@@ -90,18 +86,18 @@ class BotCore:
             }
             self.bot.signal_analyzer.update_factor_performance(factors, closed_trade.pnl > 0)
         
-        # Обновляем GUI
+        # Refresh GUI
         self._update_gui_after_close(closed_trade)
         
-        # Логируем
+        # Log outcome
         logger.info(
             f"{'✅' if closed_trade.pnl > 0 else '❌'} "
-            f"Закрыта позиция {closed_trade.symbol}: "
+            f"Closed position {closed_trade.symbol}: "
             f"P&L ${closed_trade.pnl:.2f} ({closed_trade.pnl_percent:.2f}%)"
         )
     
     def _update_gui_after_close(self, closed_trade):
-        """Обновление GUI после закрытия позиции"""
+        """Refresh GUI after closing a position."""
         current_prices_dict = {}
         for pos_symbol in self.bot.paper_trader.positions.keys():
             pos_price = self.bot.binance_client.get_current_price(pos_symbol)
@@ -117,14 +113,14 @@ class BotCore:
         pnl_sign = "+" if closed_trade.pnl >= 0 else ""
         event_text = (
             f"{'✅' if closed_trade.pnl > 0 else '❌'} "
-            f"Закрыта {closed_trade.symbol} {closed_trade.side}: "
+            f"Closed {closed_trade.symbol} {closed_trade.side}: "
             f"P&L {pnl_sign}${closed_trade.pnl:.2f} ({pnl_sign}{closed_trade.pnl_percent:.2f}%)"
         )
         self.bot._safe_gui_call(self.bot.gui.add_event, event_text, 
                                'success' if closed_trade.pnl > 0 else 'error')
     
     async def _analyze_signals(self):
-        """Анализ сигналов для всех пар"""
+        """Analyse signals for every pair."""
         all_signals = []
         processed = 0
         
@@ -138,59 +134,54 @@ class BotCore:
                 
                 if not orderbook.get('bids') or not orderbook.get('asks') or \
                    not orderbook['bids'] or not orderbook['asks']:
-                    logger.debug(f"⏸️ {symbol}: Пустой стакан")
+                    logger.debug(f"⏸️ {symbol}: empty order book")
                     continue
                 
                 processed += 1
                 
-                # Анализируем сигнал
+                # Analyse signal
                 signal = self.bot.signal_analyzer.analyze(symbol, orderbook, recent_trades)
                 self.bot.current_signals[symbol] = signal
                 
-                # Получаем адаптивные параметры
-                adaptive_params = self.bot.learning.get_adaptive_params(symbol, signal.direction)
+                # Use default parameters (adaptive learning removed)
+                adaptive_params = {
+                    'min_confidence': self.bot.config['signals']['min_confidence'],
+                    'position_size_multiplier': 1.0,
+                    'leverage_multiplier': 1.0
+                }
                 strictness_params = self._get_strictness_params()
                 
-                # Определяем минимальную уверенность
+                # Determine minimum confidence threshold
                 if self.bot.strictness_percent > 75:
                     min_conf = strictness_params['min_confidence']
                 else:
                     min_conf = max(adaptive_params['min_confidence'], 
                                  strictness_params['min_confidence'])
                 
-                # Логируем причины отказа
                 if signal.direction in ['LONG', 'SHORT']:
                     if signal.confidence < min_conf:
                         logger.info(
                             f"⏸️ {symbol}: {signal.direction} - "
                             f"confidence={signal.confidence:.1f}% < {min_conf:.1f}% "
-                            f"(min, режим={self.bot.strictness_percent:.0f}%)"
+                            f"(min, strictness={self.bot.strictness_percent:.0f}%)"
                         )
                 
-                # Если сигнал торговый - добавляем в список
                 if signal.direction in ['LONG', 'SHORT'] and signal.confidence >= min_conf:
                     trades_required = self._calculate_trades_required(signal, strictness_params)
                     
                     if len(recent_trades) < trades_required:
                         logger.info(
-                            f"⏸️ {symbol}: Недостаточно сделок "
+                            f"⏸️ {symbol}: not enough trades "
                             f"({len(recent_trades)} < {trades_required}, "
-                            f"режим={self.bot.strictness_percent:.0f}%)"
+                            f"strictness={self.bot.strictness_percent:.0f}%)"
                         )
                         continue
                     
-                    # Проверяем что нет позиции
+                    # Ensure there is no open position already
                     if symbol not in self.bot.paper_trader.positions:
-                        # Проверяем обучение
-                        if self.bot.strictness_percent <= 75 and signal.confidence < 90:
-                            if not self.bot.learning.should_trade_direction(symbol, signal.direction):
-                                logger.info(
-                                    f"⏸️ {symbol}: Направление {signal.direction} "
-                                    f"заблокировано адаптивным обучением"
-                                )
-                                continue
+                        # Adaptive learning removed - always allow trading
                         
-                        # Рассчитываем приоритет
+                        # Calculate priority
                         expected_profit_percent = abs(
                             signal.take_profit_1 - signal.entry_price
                         ) / signal.entry_price
@@ -205,14 +196,14 @@ class BotCore:
                         })
             
             except Exception as e:
-                logger.error(f"Ошибка анализа {symbol}: {e}")
+                logger.error(f"Signal analysis failed for {symbol}: {e}")
                 continue
         
-        logger.debug(f"📊 Обработано {processed}/{len(self.bot.pairs)} пар, сигналов: {len(all_signals)}")
+        logger.debug(f"📊 Processed {processed}/{len(self.bot.pairs)} pairs, signals: {len(all_signals)}")
         return all_signals
     
     async def _open_best_positions(self, all_signals):
-        """Открытие лучших позиций"""
+        """Open top-priority positions."""
         all_signals.sort(key=lambda x: x['priority'], reverse=True)
         
         max_positions = self.bot.config['account']['max_positions']
@@ -224,17 +215,17 @@ class BotCore:
             
             signal = signal_data['signal']
             
-            # Получаем актуальный стакан
+            # Fetch current order book
             if signal.confidence >= 90:
                 orderbook = signal_data.get('orderbook')
             else:
                 orderbook = self.bot.binance_client.get_orderbook(signal.symbol)
             
             if not orderbook or not orderbook.get('bids') or not orderbook.get('asks'):
-                logger.debug(f"⏸️ {signal.symbol}: Нет актуального стакана")
+                logger.debug(f"⏸️ {signal.symbol}: no up-to-date order book")
                 continue
             
-            # Проверяем изменение цены
+            # Validate price change tolerance
             if self.bot.strictness_percent <= 75 and signal.confidence < 90:
                 current_price = self.bot.binance_client.get_current_price(signal.symbol)
                 if current_price == 0:
@@ -244,12 +235,12 @@ class BotCore:
                 price_diff = abs(current_price - signal.entry_price) / signal.entry_price
                 if price_diff > strictness_params['max_price_diff']:
                     logger.debug(
-                        f"⏸️ {signal.symbol}: Цена изменилась {price_diff*100:.2f}% > "
-                        f"{strictness_params['max_price_diff']*100:.2f}%, пропускаем"
+                        f"⏸️ {signal.symbol}: price moved {price_diff*100:.2f}% > "
+                        f"{strictness_params['max_price_diff']*100:.2f}%, skipping"
                     )
                     continue
             
-            # Открываем позицию
+            # Open the position
             adaptive_params = signal_data.get('adaptive_params', {})
             position = self.bot.paper_trader.open_position(signal, orderbook, adaptive_params)
             
@@ -257,14 +248,14 @@ class BotCore:
                 current_positions += 1
                 logger.info(
                     f"{'🟢' if position.side == 'LONG' else '🔴'} "
-                    f"Открыта позиция {position.symbol} {position.side}: "
-                    f"${position.entry_price:.2f} (плечо: {position.leverage}x, "
-                    f"уверенность: {signal.confidence:.1f}%, "
-                    f"приоритет: {signal_data['priority']:.1f})"
+                    f"Opened {position.symbol} {position.side}: "
+                    f"${position.entry_price:.2f} (leverage: {position.leverage}x, "
+                    f"confidence: {signal.confidence:.1f}%, "
+                    f"priority: {signal_data['priority']:.1f})"
                 )
     
     def _log_statistics(self):
-        """Логирование статистики и автосохранение"""
+        """Log trading statistics and handle autosave."""
         if self.bot._last_signal_log is not None:
             elapsed = (datetime.now() - self.bot._last_signal_log).total_seconds()
             if elapsed >= 60:
@@ -277,21 +268,27 @@ class BotCore:
                     if sig.direction == 'SHORT'
                 )
                 
+
                 logger.info(
-                    f"📊 Сигналы: LONG {long_count}, SHORT {short_count} "
-                    f"из {len(self.bot.current_signals)} пар"
+                    f"📊 Signals: LONG {long_count}, SHORT {short_count} "
+                    f"across {len(self.bot.current_signals)} pairs"
                 )
                 
                 total_pnl = self.bot.paper_trader.balance - self.bot.paper_trader.starting_balance
-                logger.info(f"💰 Баланс: ${self.bot.paper_trader.balance:.2f}, P&L: ${total_pnl:+.2f}")
-                logger.info(self.bot.learning.get_learning_summary())
-                
-                # Автосохранение
-                if self.bot.config['logging']['save_session']:
-                    filename = f"results/autosave_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
-                    Path("results").mkdir(exist_ok=True)
-                    self.bot.paper_trader.save_session(filename)
-                    logger.info(f"💾 Автосохранение: {filename}")
+                logger.info(f"💰 Balance: ${self.bot.paper_trader.balance:.2f}, P&L: ${total_pnl:+.2f}")
+                if hasattr(self.bot, 'connection_stats'):
+                    last_error = self.bot.connection_stats.get('last_error') or 'none'
+                    logger.info(
+                        "🔁 Reconnects: %s (last error: %s)",
+                        self.bot.connection_stats.get('reconnects', 0),
+                        last_error
+                    )
+            # Adaptive learning removed
+            if self.bot.config['logging']['save_session']:
+                filename = f"results/autosave_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
+                Path("results").mkdir(exist_ok=True)
+                self.bot.paper_trader.save_session(filename)
+                # Autosave silent - only log errors
                 
                 self.bot._last_signal_log = datetime.now()
         else:
