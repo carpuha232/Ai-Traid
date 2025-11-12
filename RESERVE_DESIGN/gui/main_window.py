@@ -581,13 +581,10 @@ class TradingPrototype(QtWidgets.QMainWindow):
             else:
                 pnl = (entry_price - current_price) * size
             
-            # Get position size in USDT (without leverage) = margin
-            # Use margin_usdt if available, otherwise calculate manually
-            if hasattr(pos, 'margin_usdt') and pos.margin_usdt > 0:
-                position_value_usdt = pos.margin_usdt
-            else:
-                # Fallback: calculate from position value / leverage
-                position_value_usdt = (entry_price * size) / leverage
+            # Calculate R:R
+            risk = abs(entry_price - stop_loss)
+            reward = abs(take_profit - entry_price)
+            rr_ratio = f"1:{reward/risk:.1f}" if risk > 0 else "1:0"
             
             # Column 0: Symbol (цвет по направлению)
             symbol_item = QtWidgets.QTableWidgetItem(symbol)
@@ -600,7 +597,7 @@ class TradingPrototype(QtWidgets.QMainWindow):
             leverage_item = QtWidgets.QTableWidgetItem(f"{leverage}x")
             self.positions_widget.setItem(row, 1, leverage_item)
             
-            # Column 2-8: Entry, Current, Size, SL, TP, PNL, USDT
+            # Column 2-8: Entry, Current, Size, SL, TP, PNL, R:R
             self.positions_widget.setItem(row, 2, QtWidgets.QTableWidgetItem(f"{entry_price:,.2f}"))
             self.positions_widget.setItem(row, 3, QtWidgets.QTableWidgetItem(f"{current_price:,.2f}"))
             self.positions_widget.setItem(row, 4, QtWidgets.QTableWidgetItem(f"{size:,.4f}"))
@@ -611,8 +608,7 @@ class TradingPrototype(QtWidgets.QMainWindow):
             pnl_item.setForeground(QtGui.QColor("#0ECB81") if pnl >= 0 else QtGui.QColor("#F6465D"))
             self.positions_widget.setItem(row, 7, pnl_item)
             
-            # Column 8: Position size in USDT (without leverage)
-            self.positions_widget.setItem(row, 8, QtWidgets.QTableWidgetItem(f"${position_value_usdt:,.2f}"))
+            self.positions_widget.setItem(row, 8, QtWidgets.QTableWidgetItem(rr_ratio))
             
             # Column 9: Close button (30% smaller, centered)
             close_btn = QtWidgets.QPushButton("Закрыть")

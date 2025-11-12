@@ -149,7 +149,8 @@ class SignalAnalyzer:
         base_prob_up = self._probability_to_level(resistance_price - current_price, sigma, horizon, current_price)
         base_prob_down = self._probability_to_level(current_price - support_price, sigma, horizon, current_price)
 
-        if wall_score < 55 or spread_score < 55:
+        # Lowered liquidity requirements - 40 instead of 55
+        if wall_score < 40 or spread_score < 40:
             return self._wait_signal(symbol, "Недостаточно ликвидности")
 
         bullish_strength = 0
@@ -225,9 +226,19 @@ class SignalAnalyzer:
         if prob_up >= threshold_long and prob_up > prob_down and bullish_strength > bearish_strength and key_conditions >= 2:
             direction = 'LONG'
             confidence = prob_up * 100.0
+            # Bonus for strong signals
+            if bullish_strength >= 5:
+                confidence += 3.0
+            if key_conditions >= 3:
+                confidence += 2.0
         elif prob_down >= threshold_short and prob_down > prob_up and bearish_strength > bullish_strength and key_conditions >= 2:
             direction = 'SHORT'
             confidence = prob_down * 100.0
+            # Bonus for strong signals
+            if bearish_strength >= 5:
+                confidence += 3.0
+            if key_conditions >= 3:
+                confidence += 2.0
         else:
             return self._wait_signal(symbol, f"P(up)={prob_up:.2f}, P(down)={prob_down:.2f}")
 

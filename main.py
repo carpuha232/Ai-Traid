@@ -192,16 +192,6 @@ class AutoScalpingBot:
         logger.info("🔄 Manual refresh requested")
         self._update_gui()
     
-    def _on_close_all_clicked(self):
-        """Handle close all positions button."""
-        self.close_all_positions()
-    
-    def _on_pause_toggled(self, checked: bool):
-        """Handle pause button toggle."""
-        self.paused = checked
-        status = "PAUSED" if checked else "RESUMED"
-        logger.info(f"⏸️ Bot {status}")
-    
     def _safe_gui_call(self, signal, *args):
         """Emit Qt signal for thread-safe GUI updates."""
         try:
@@ -438,8 +428,6 @@ class AutoScalpingBot:
             self.gui.control_panel.connectionToggled.connect(self._on_connection_toggle)
             self.gui.control_panel.autoTradingToggled.connect(self._on_auto_trading_toggle)
             self.gui.control_panel.refreshRequested.connect(self._on_refresh_requested)
-            self.gui.close_all_button.clicked.connect(self._on_close_all_clicked)
-            self.gui.pause_button.toggled.connect(self._on_pause_toggled)
             
             # Set close callback
             self.app.aboutToQuit.connect(self._on_window_close)

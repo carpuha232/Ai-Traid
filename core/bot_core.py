@@ -43,22 +43,13 @@ class BotCore:
     
     def _calculate_trades_required(self, signal, strictness_params):
         """Determine the number of trades required for the given mode."""
-        min_trades_required = strictness_params['min_trades']
-        
-        if self.bot.strictness_percent > 75:  # Aggressive
-            if signal.confidence >= 90:
-                return max(10, min_trades_required - 2)
-            elif signal.confidence >= 80:
-                return max(10, min_trades_required - 1)
-            return min_trades_required
-        elif self.bot.strictness_percent > 25:  # Moderate
-            if signal.confidence >= 90:
-                return 5
-            elif signal.confidence >= 80:
-                return max(5, min_trades_required - 1)
-            return min_trades_required
-        
-        return min_trades_required  # Conservative
+        # Lowered requirements - 3 trades minimum instead of 6+
+        if signal.confidence >= 70:
+            return 3
+        elif signal.confidence >= 60:
+            return 4
+        else:
+            return 5
     
     async def _update_positions(self):
         """Update open positions."""
@@ -121,6 +112,10 @@ class BotCore:
     
     async def _analyze_signals(self):
         """Analyse signals for every pair."""
+        # Check if paused (Авто ВЫКЛ)
+        if self.bot.paused:
+            return
+        
         all_signals = []
         processed = 0
         
