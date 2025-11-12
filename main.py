@@ -111,7 +111,7 @@ class AutoScalpingBot:
         
         # State
         self.running = False
-        self.paused = False  # For "Pause" button
+        self.paused = True  # Start with auto-trading DISABLED (user must enable it)
         self.pairs = self.config['pairs']
         self.current_signals = {}
         self._last_signal_log = None
@@ -170,27 +170,50 @@ class AutoScalpingBot:
             self.app.quit()
     
     def _on_connection_toggle(self, connected: bool):
-        """Handle connection button toggle."""
+        """Handle connection button toggle - controls opening new positions."""
+        self.paused = not connected
         if connected:
-            logger.info("🔄 Starting bot from GUI...")
-            # Start bot if not running
-            if not self.running:
-                asyncio_thread = threading.Thread(target=self._asyncio_thread, daemon=True)
-                asyncio_thread.start()
+            logger.info("✅ Trading ENABLED - bot will open new positions")
         else:
-            logger.info("⏹️ Stopping bot from GUI...")
-            self.running = False
+            logger.info("⏸️ Trading PAUSED - bot will NOT open new positions (analysis continues)")
     
-    def _on_auto_trading_toggle(self, active: bool):
-        """Handle auto trading toggle."""
-        self.paused = not active
-        status = "ENABLED" if active else "DISABLED"
-        logger.info(f"🤖 Auto trading {status}")
-    
-    def _on_refresh_requested(self):
-        """Handle refresh button click."""
-        logger.info("🔄 Manual refresh requested")
-        self._update_gui()
+    def _on_close_position_requested(self, symbol: str):
+        """Handle close position button click from GUI."""
+        logger.info(f"🔴 Manual close requested for {symbol}")
+        
+        # Get position data before closing
+        if symbol in self.paper_trader.positions:
+            position = self.paper_trader.positions[symbol]
+            current_price = self.binance_client.get_current_price(symbol)
+            
+            # Calculate PNL before closing
+            if position.side == 'LONG':
+                pnl = (current_price - position.entry_price) * position.size
+            else:
+                pnl = (position.entry_price - current_price) * position.size
+            
+            pnl_percent = (pnl / (position.entry_price * position.size / position.leverage)) * 100
+            
+            # Close position
+            success = self.close_position(symbol, 'Manual Close')
+            if success:
+                # Add to activity log
+                if self.gui and hasattr(self.gui, 'activity_log'):
+                    try:
+                        self.gui.activity_log.add_position_closed(symbol, {
+                            'pnl': pnl,
+                            'pnl_percent': pnl_percent,
+                            'reason': 'Manual Close'
+                        })
+                    except (RuntimeError, AttributeError) as e:
+                        logger.debug(f"Activity log update failed: {e}")
+                
+                # Update GUI after closing position
+                self._update_gui()
+            else:
+                logger.warning(f"⚠️ Failed to close position {symbol}")
+        else:
+            logger.warning(f"⚠️ Position {symbol} not found")
     
     def _safe_gui_call(self, signal, *args):
         """Emit Qt signal for thread-safe GUI updates."""
@@ -426,13 +449,13 @@ class AutoScalpingBot:
             
             # Connect GUI signals to bot methods
             self.gui.control_panel.connectionToggled.connect(self._on_connection_toggle)
-            self.gui.control_panel.autoTradingToggled.connect(self._on_auto_trading_toggle)
-            self.gui.control_panel.refreshRequested.connect(self._on_refresh_requested)
+            self.gui.positions_widget.closePositionRequested.connect(self._on_close_position_requested)
             
             # Set close callback
             self.app.aboutToQuit.connect(self._on_window_close)
             
-            # Auto-start bot
+            # Auto-start bot immediately
+            self.paused = False  # Enable trading from the start
             logger.info("🚀 Auto-starting bot...")
             asyncio_thread = threading.Thread(target=self._asyncio_thread, daemon=True)
             asyncio_thread.start()

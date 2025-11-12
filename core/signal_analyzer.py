@@ -149,13 +149,19 @@ class SignalAnalyzer:
         base_prob_up = self._probability_to_level(resistance_price - current_price, sigma, horizon, current_price)
         base_prob_down = self._probability_to_level(current_price - support_price, sigma, horizon, current_price)
 
-        # Lowered liquidity requirements - 40 instead of 55
-        if wall_score < 40 or spread_score < 40:
-            return self._wait_signal(symbol, "Недостаточно ликвидности")
+        # Quality thresholds from config
+        min_wall = self.config['signals'].get('min_wall_score', 60)
+        min_spread = self.config['signals'].get('min_spread_score', 70)
+        
+        if wall_score < min_wall or spread_score < min_spread:
+            return self._wait_signal(symbol, f"Ликвидность {wall_score:.0f}/{spread_score:.0f} < {min_wall}/{min_spread}")
 
         bullish_strength = 0
         bearish_strength = 0
 
+        # Key conditions threshold from config
+        min_key_conditions = self.config['signals'].get('min_key_conditions', 3)
+        
         key_conditions = 0
         if wall_score >= 65 and spread_score >= 60:
             key_conditions += 1
@@ -220,27 +226,39 @@ class SignalAnalyzer:
             f"{symbol}: prob_up={prob_up:.2f}, prob_down={prob_down:.2f}, bull={bullish_strength}, bear={bearish_strength}"
         )
 
-        threshold_long = getattr(self, 'prob_threshold_long', self.min_confidence / 100.0)
-        threshold_short = getattr(self, 'prob_threshold_short', self.config['signals'].get('min_confidence_short', 66) / 100.0)
+        threshold_long = 0.53  # Balanced thresholds (same as short)
+        threshold_short = 0.53  # Equal conditions for LONG and SHORT
+        
+        # Momentum bonus: if momentum aligns with signal direction
+        momentum_bonus = 0.0
+        if self.config['signals'].get('momentum_bonus_enabled', True):
+            if momentum_score >= 70 and prob_up > prob_down:  # Momentum UP + signal UP
+                momentum_bonus = 5.0
+            elif momentum_score <= 30 and prob_down > prob_up:  # Momentum DOWN + signal DOWN
+                momentum_bonus = 5.0
 
-        if prob_up >= threshold_long and prob_up > prob_down and bullish_strength > bearish_strength and key_conditions >= 2:
+        if prob_up >= threshold_long and prob_up > prob_down and bullish_strength > bearish_strength and key_conditions >= min_key_conditions:
             direction = 'LONG'
             confidence = prob_up * 100.0
             # Bonus for strong signals
             if bullish_strength >= 5:
                 confidence += 3.0
-            if key_conditions >= 3:
+            if key_conditions >= min_key_conditions + 1:  # Extra conditions bonus
                 confidence += 2.0
-        elif prob_down >= threshold_short and prob_down > prob_up and bearish_strength > bullish_strength and key_conditions >= 2:
+            # Momentum bonus
+            confidence += momentum_bonus
+        elif prob_down >= threshold_short and prob_down > prob_up and bearish_strength > bullish_strength and key_conditions >= min_key_conditions:
             direction = 'SHORT'
             confidence = prob_down * 100.0
             # Bonus for strong signals
             if bearish_strength >= 5:
                 confidence += 3.0
-            if key_conditions >= 3:
+            if key_conditions >= min_key_conditions + 1:  # Extra conditions bonus
                 confidence += 2.0
+            # Momentum bonus
+            confidence += momentum_bonus
         else:
-            return self._wait_signal(symbol, f"P(up)={prob_up:.2f}, P(down)={prob_down:.2f}")
+            return self._wait_signal(symbol, f"P(up)={prob_up:.2f}, P(down)={prob_down:.2f}, keys={key_conditions}/{min_key_conditions}")
 
         confidence = min(confidence, 99.0)
         

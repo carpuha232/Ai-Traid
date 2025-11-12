@@ -69,15 +69,11 @@ class TradingPrototype(QtWidgets.QMainWindow):
         status.showMessage("No connection • Mock mode")
 
         self.control_panel.connectionToggled.connect(self._on_connection_toggle)
-        self.control_panel.autoTradingToggled.connect(self._on_auto_trading_toggle)
-        self.control_panel.refreshRequested.connect(self._on_refresh_requested)
 
         self._connection_active = True
-        self._auto_trading_active = False
 
         # Initialize with zero data (will be updated by bot)
-        self.control_panel.set_connection_toggle_state(False, silent=True)
-        self.control_panel.set_auto_trading_state(False, silent=True)
+        self.control_panel.set_connection_toggle_state(True, silent=True)  # Start as "connected"
         self.control_panel.update_balance(0)
         self.control_panel.update_pnl(0)
         self.control_panel.update_winrate(0)
@@ -162,16 +158,6 @@ class TradingPrototype(QtWidgets.QMainWindow):
         else:
             self.statusBar().showMessage("Соединение закрыто • Моковый режим", 3000)
 
-    @QtCore.Slot(bool)
-    def _on_auto_trading_toggle(self, active: bool) -> None:
-        self._auto_trading_active = active
-        message = "Автоторговля запущена • Моковый режим" if active else "Автоторговля остановлена • Моковый режим"
-        self.statusBar().showMessage(message, 3000)
-
-    @QtCore.Slot()
-    def _on_refresh_requested(self) -> None:
-        # Refresh will be handled by bot calling update methods
-        self.statusBar().showMessage("Данные обновляются...", 2000)
 
     def _apply_styles(self):
         palette = QtGui.QPalette()
@@ -516,6 +502,10 @@ class TradingPrototype(QtWidgets.QMainWindow):
     
     # ========== DATA UPDATE METHODS ==========
     
+    def _handle_close_button(self, symbol: str):
+        """Handle close button click - called directly from button."""
+        self.positions_widget.closePositionRequested.emit(symbol)
+    
     def update_account_data(self, balance: float, pnl: float, winrate: float, drawdown: float, positions_count: int):
         """Update account metrics in control panel."""
         self.control_panel.update_balance(balance)
@@ -556,14 +546,14 @@ class TradingPrototype(QtWidgets.QMainWindow):
     
     def update_positions_data(self, positions: dict, current_prices: dict):
         """Update positions table."""
-        self.positions_widget.setSortingEnabled(False)
-        self.positions_widget.setRowCount(0)
-        
         if not positions:
-            self.positions_widget.setSortingEnabled(True)
+            self.positions_widget.setRowCount(0)
             return
         
+        # Set row count to match positions
         self.positions_widget.setRowCount(len(positions))
+        
+        # Update each position row
         for row, (symbol, pos) in enumerate(positions.items()):
             current_price = current_prices.get(symbol, 0)
             
@@ -614,25 +604,25 @@ class TradingPrototype(QtWidgets.QMainWindow):
             # Column 8: Position size in USDT (without leverage)
             self.positions_widget.setItem(row, 8, QtWidgets.QTableWidgetItem(f"${position_value_usdt:,.2f}"))
             
-            # Column 9: Close button (30% smaller, centered)
+            # Column 9: Close button
             close_btn = QtWidgets.QPushButton("Закрыть")
-            close_btn.setObjectName("DangerButton")
             close_btn.setCursor(QtGui.QCursor(QtCore.Qt.CursorShape.PointingHandCursor))
-            close_btn.setMinimumHeight(17)  # 24 * 0.7 = 16.8 ≈ 17
-            close_btn.setMaximumHeight(17)
-            close_btn.setStyleSheet("font-size: 10px; padding: 2px 6px;")  # Smaller font
-            close_btn.clicked.connect(lambda checked, s=symbol: self.positions_widget.closePositionRequested.emit(s))
-            
-            # Center button in cell
-            btn_container = QtWidgets.QWidget()
-            btn_layout = QtWidgets.QHBoxLayout(btn_container)
-            btn_layout.setContentsMargins(4, 0, 4, 0)
-            btn_layout.addWidget(close_btn)
-            btn_layout.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
-            
-            self.positions_widget.setCellWidget(row, 9, btn_container)
-        
-        self.positions_widget.setSortingEnabled(True)
+            close_btn.setFocusPolicy(QtCore.Qt.FocusPolicy.NoFocus)
+            close_btn.setStyleSheet("""
+                QPushButton {
+                    background-color: #F6465D;
+                    color: white;
+                    border: none;
+                    border-radius: 3px;
+                    font-size: 10px;
+                    font-weight: 600;
+                    padding: 2px 6px;
+                    min-height: 17px;
+                    max-height: 17px;
+                }
+            """)
+            close_btn.clicked.connect(lambda checked=False, s=symbol: self._handle_close_button(s))
+            self.positions_widget.setCellWidget(row, 9, close_btn)
     
     def update_history_data(self, closed_trades: list):
         """Update history table."""

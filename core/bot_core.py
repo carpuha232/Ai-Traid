@@ -57,9 +57,25 @@ class BotCore:
             try:
                 current_price = self.bot.binance_client.get_current_price(symbol)
                 if current_price > 0:
-                    closed_trade = self.bot.paper_trader.update_positions(symbol, current_price)
+                    # Get current signal for momentum score
+                    signal = self.bot.current_signals.get(symbol)
+                    momentum_score = getattr(signal, 'momentum_score', 50.0) if signal else 50.0
+                    
+                    closed_trade = self.bot.paper_trader.update_positions(symbol, current_price, momentum_score)
                     if closed_trade:
                         self._handle_closed_trade(closed_trade)
+                    
+                    # Pyramiding check: if position in profit and signal strong → add to position
+                    if self.bot.config['risk'].get('use_pyramiding', True):
+                        position = self.bot.paper_trader.positions.get(symbol)
+                        if position and signal and hasattr(signal, 'confidence'):
+                            # Check if can add to position
+                            if self.bot.paper_trader.can_add_to_position(symbol):
+                                # Only add if signal is still strong (same direction + high confidence)
+                                if position.side == 'LONG' and signal.direction == 'LONG' and signal.confidence >= 65:
+                                    self.bot.paper_trader.add_to_position(symbol, current_price, signal.confidence)
+                                elif position.side == 'SHORT' and signal.direction == 'SHORT' and signal.confidence >= 65:
+                                    self.bot.paper_trader.add_to_position(symbol, current_price, signal.confidence)
             except Exception as e:
                 logger.error(f"Failed to update position {symbol}: {e}")
     

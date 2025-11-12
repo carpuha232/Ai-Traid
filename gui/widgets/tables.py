@@ -366,9 +366,12 @@ class PositionsWidget(MockTable):
         super().__init__(0, 10, parent)
         self.setHorizontalHeaderLabels(["Пара", "Плечо", "Вход", "Текущая", "Размер", "SL", "TP", "PNL", "USDT", ""])
         # Don't populate mock data - wait for real data from bot
-        self.setSortingEnabled(True)
+        # DISABLE sorting - it causes rows to jump and buttons to disconnect
+        self.setSortingEnabled(False)
         self.horizontalHeader().setSectionResizeMode(9, QtWidgets.QHeaderView.ResizeMode.Fixed)
         self.setColumnWidth(9, 65)  # Fixed width for close button column (smaller)
+        # DISABLE cell selection - no blue highlighting
+        self.setSelectionMode(QtWidgets.QAbstractItemView.SelectionMode.NoSelection)
 
     def populate_mock_data(self):
         self.setSortingEnabled(False)

@@ -43,6 +43,9 @@ class Position:
     highest_profit_price: float = 0.0  # Для LONG
     lowest_profit_price: float = 0.0  # Для SHORT
 
+    # Pyramiding
+    pyramided: bool = False  # Добавляли ли к позиции
+
 
 @dataclass
 class ClosedTrade:
@@ -139,6 +142,12 @@ class PaperTrader:
             
         Returns:
             Плечо от 50 до 100
+        
+        Новая механика:
+            60% confidence → 50x
+            70% confidence → 67x
+            80% confidence → 83x
+            90%+ confidence → 100x
         """
         if not self.config['account'].get('dynamic_leverage', False):
             return self.leverage
@@ -147,14 +156,14 @@ class PaperTrader:
         min_lev = self.config['account'].get('leverage_min', 50)
         max_lev = self.config['account'].get('leverage_max', 100)
         
-        # Линейная интерполяция: 75% уверенности = 50x, 95%+ = 100x
-        if confidence >= 95:
+        # Линейная интерполяция: 60% → 50x, 90%+ → 100x
+        if confidence >= 90:
             return max_lev
-        elif confidence <= 75:
+        elif confidence <= 60:
             return min_lev
         else:
-            # От 75% до 95% = от 50x до 100x
-            progress = (confidence - 75) / (95 - 75)
+            # От 60% до 90% = от 50x до 100x
+            progress = (confidence - 60) / (90 - 60)
             leverage = int(min_lev + progress * (max_lev - min_lev))
             return leverage
     
@@ -294,13 +303,14 @@ class PaperTrader:
         
         return position
     
-    def update_positions(self, symbol: str, current_price: float) -> Optional[ClosedTrade]:
+    def update_positions(self, symbol: str, current_price: float, momentum_score: float = 50.0) -> Optional[ClosedTrade]:
         """
         Обновить позицию текущей ценой и проверить стоп/тейк
         
         Args:
             symbol: Торговая пара
             current_price: Текущая цена
+            momentum_score: Текущий momentum (0-100, 50=нейтрально)
             
         Returns:
             ClosedTrade если позиция закрыта, None если еще открыта
@@ -328,6 +338,32 @@ class PaperTrader:
         
         # PNL в процентах
         position.unrealized_pnl_percent = price_change_percent
+        
+        # BREAKEVEN SL: Переместить SL в точку входа при +0.5%
+        if self.config['risk'].get('use_breakeven_sl', True):
+            breakeven_trigger = self.config['risk'].get('breakeven_trigger_percent', 0.5)
+            
+            if position.side == 'LONG':
+                # Если позиция в прибыли >= 0.5% и SL еще не перемещен
+                if position.unrealized_pnl_percent >= breakeven_trigger and position.stop_loss < position.entry_price:
+                    position.stop_loss = position.entry_price
+                    logger.info(f"🔒 {symbol}: Breakeven SL активирован - стоп перемещен в точку входа ${position.entry_price:.4f}")
+            else:  # SHORT
+                # Если позиция в прибыли >= 0.5% и SL еще не перемещен
+                if position.unrealized_pnl_percent >= breakeven_trigger and position.stop_loss > position.entry_price:
+                    position.stop_loss = position.entry_price
+                    logger.info(f"🔒 {symbol}: Breakeven SL активирован - стоп перемещен в точку входа ${position.entry_price:.4f}")
+        
+        # EARLY EXIT: Выход при изменении momentum
+        if self.config['risk'].get('use_early_exit', True):
+            # Если LONG позиция, но momentum стал bearish (< 40)
+            if position.side == 'LONG' and momentum_score < 40:
+                logger.info(f"⚠️ {symbol}: Early Exit - momentum изменился (LONG, но momentum={momentum_score:.0f} < 40)")
+                return self._close_position(position, current_price, "Early Exit (momentum)")
+            # Если SHORT позиция, но momentum стал bullish (> 60)
+            elif position.side == 'SHORT' and momentum_score > 60:
+                logger.info(f"⚠️ {symbol}: Early Exit - momentum изменился (SHORT, но momentum={momentum_score:.0f} > 60)")
+                return self._close_position(position, current_price, "Early Exit (momentum)")
         
         # Проверяем Take Profit 1 (СНАЧАЛА, до проверки стопов)
         tp1_reached = False
@@ -511,6 +547,71 @@ class PaperTrader:
         )
         
         return closed_trade
+    
+    def can_add_to_position(self, symbol: str) -> bool:
+        """
+        Проверка можно ли добавить к позиции (pyramiding)
+        
+        Returns:
+            True если позиция есть и можно добавить
+        """
+        if symbol not in self.positions:
+            return False
+        
+        position = self.positions[symbol]
+        
+        # Проверяем что позиция в прибыли >= 1%
+        if position.unrealized_pnl_percent < self.config['risk'].get('pyramiding_trigger_percent', 1.0):
+            return False
+        
+        # Проверяем что не добавляли уже (можно добавить только 1 раз)
+        if hasattr(position, 'pyramided') and position.pyramided:
+            return False
+        
+        # Проверяем что есть свободные средства
+        available = self.get_available_balance()
+        if available <= 0:
+            return False
+        
+        return True
+    
+    def add_to_position(self, symbol: str, current_price: float, signal_confidence: float) -> bool:
+        """
+        Добавить к позиции (pyramiding)
+        
+        Args:
+            symbol: Торговая пара
+            current_price: Текущая цена
+            signal_confidence: Уверенность сигнала
+            
+        Returns:
+            True если успешно добавлено
+        """
+        if not self.can_add_to_position(symbol):
+            return False
+        
+        position = self.positions[symbol]
+        
+        # Добавляем 50% от текущего размера позиции
+        additional_margin = position.margin_usdt * 0.5
+        additional_size = (additional_margin * position.leverage) / current_price
+        
+        # Обновляем позицию
+        old_size = position.size
+        old_value = position.position_value_usdt
+        old_margin = position.margin_usdt
+        
+        position.size += additional_size
+        position.position_value_usdt += additional_margin * position.leverage
+        position.margin_usdt += additional_margin
+        
+        # Помечаем что добавили к позиции
+        position.pyramided = True
+        
+        logger.info(f"📈 {symbol}: Pyramiding - добавлено {additional_size:.4f} (было {old_size:.4f}, стало {position.size:.4f})")
+        logger.info(f"   Маржа: ${old_margin:.2f} → ${position.margin_usdt:.2f}, Позиция: ${old_value:.2f} → ${position.position_value_usdt:.2f}")
+        
+        return True
     
     def close_position_manually(self, symbol: str, current_price: float, reason: str):
         """Закрыть позицию вручную"""

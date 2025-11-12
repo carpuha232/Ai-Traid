@@ -55,42 +55,20 @@ class ControlPanel(QtWidgets.QFrame):
 
         layout.addSpacing(20)
 
-        # === RIGHT: Compact action buttons ===
-        buttons_layout = QtWidgets.QHBoxLayout()
-        buttons_layout.setSpacing(8)
-
-        self.connection_button = QtWidgets.QPushButton("Подключить")
+        # === RIGHT: Trading control button ===
+        self.connection_button = QtWidgets.QPushButton("Отключить")
         self.connection_button.setObjectName("PrimaryButton")
         self.connection_button.setCursor(QtGui.QCursor(QtCore.Qt.CursorShape.PointingHandCursor))
         self.connection_button.setCheckable(True)
         self.connection_button.setMinimumHeight(36)
         self.connection_button.setFixedWidth(110)
-        buttons_layout.addWidget(self.connection_button)
-
-        self.auto_button = QtWidgets.QPushButton("Авто ВЫКЛ")
-        self.auto_button.setObjectName("SecondaryButton")
-        self.auto_button.setCursor(QtGui.QCursor(QtCore.Qt.CursorShape.PointingHandCursor))
-        self.auto_button.setCheckable(True)
-        self.auto_button.setMinimumHeight(36)
-        self.auto_button.setFixedWidth(110)
-        buttons_layout.addWidget(self.auto_button)
-
-        self.refresh_button = QtWidgets.QPushButton("⟳")
-        self.refresh_button.setObjectName("GhostButton")
-        self.refresh_button.setCursor(QtGui.QCursor(QtCore.Qt.CursorShape.PointingHandCursor))
-        self.refresh_button.setMinimumHeight(36)
-        self.refresh_button.setFixedWidth(36)
-        buttons_layout.addWidget(self.refresh_button)
-
-        layout.addLayout(buttons_layout)
+        self.connection_button.setChecked(True)  # Start in "connected" state
+        layout.addWidget(self.connection_button)
 
         # Wire signals
         self.connection_button.toggled.connect(self._on_connection_toggled)
-        self.auto_button.toggled.connect(self._on_auto_trading_toggled)
-        self.refresh_button.clicked.connect(self._on_refresh_clicked)
 
-        self._update_connection_button_text(False)
-        self._update_auto_button_text(False)
+        self._update_connection_button_text(True)  # Start as "connected"
 
     def _stat_chip(self, title: str, value: str) -> QtWidgets.QFrame:
         chip = QtWidgets.QFrame()
@@ -181,36 +159,14 @@ class ControlPanel(QtWidgets.QFrame):
         if silent:
             self.connection_button.blockSignals(False)
 
-    def set_auto_trading_state(self, active: bool, silent: bool = False) -> None:
-        if silent:
-            self.auto_button.blockSignals(True)
-        self.auto_button.setChecked(active)
-        self._update_auto_button_text(active)
-        if silent:
-            self.auto_button.blockSignals(False)
-
-
-
     def _on_connection_toggled(self, checked: bool) -> None:
         self._update_connection_button_text(checked)
         self.connectionToggled.emit(checked)
-
-    def _on_auto_trading_toggled(self, checked: bool) -> None:
-        self._update_auto_button_text(checked)
-        self.autoTradingToggled.emit(checked)
-
-    def _on_refresh_clicked(self) -> None:
-        self.refreshRequested.emit()
 
     def _update_connection_button_text(self, connected: bool) -> None:
         self.connection_button.setText("Отключить" if connected else "Подключить")
         self.connection_button.setProperty("active", "true" if connected else "false")
         self._refresh_widget(self.connection_button)
-
-    def _update_auto_button_text(self, active: bool) -> None:
-        self.auto_button.setText("Авто ВКЛ" if active else "Авто ВЫКЛ")
-        self.auto_button.setProperty("active", "true" if active else "false")
-        self._refresh_widget(self.auto_button)
 
     @staticmethod
     def _refresh_widget(widget: QtWidgets.QWidget) -> None:
