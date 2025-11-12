@@ -38,20 +38,15 @@ class TradingSignal:
 class SignalAnalyzer:
     """
     Анализатор сигналов на основе стакана ордеров
-    Использует теорию вероятности для повышения винрейта:
-    - Байесовское обновление уверенности
-    - Expected Value (EV) расчет
-    - Адаптивные веса факторов
+    Использует теорию вероятности для генерации торговых сигналов.
     """
     
-    def __init__(self, config: Dict, learning_system=None):
+    def __init__(self, config: Dict):
         """
         Args:
             config: Словарь с настройками из config.json
-            learning_system: Система адаптивного обучения (опционально)
         """
         self.config = config
-        self.learning_system = learning_system  # Для доступа к статистике
         
         # Параметры анализа
         self.min_confidence = config['signals']['min_confidence']
@@ -737,160 +732,6 @@ class SignalAnalyzer:
 
     def _normal_cdf(self, x: float) -> float:
         return 0.5 * (1.0 + math.erf(x / math.sqrt(2.0)))
-
-    def _apply_bayesian_update(self, symbol: str, direction: str, prior_confidence: float) -> float:
-        """
-        БАЙЕСОВСКОЕ ОБНОВЛЕНИЕ уверенности на основе исторического win rate
-        
-        Теорема Байеса: P(win|signal) = P(signal|win) × P(win) / P(signal)
-        
-        Args:
-            symbol: Торговая пара
-            direction: Направление (LONG/SHORT)
-            prior_confidence: Априорная уверенность (0-100)
-            
-        Returns:
-            Обновленная уверенность (0-100), или 0 если нет данных
-        """
-        if not self.learning_system:
-            return 0.0
-        
-        # Получаем статистику для этой пары + направления
-        stats = self.learning_system.stats.get(symbol, {}).get(direction)
-        if not stats or stats.total < 10:
-            return 0.0  # Недостаточно данных
-        
-        # Исторический win rate (likelihood)
-        historical_win_rate = stats.win_rate / 100.0  # 0-1
-        
-        # Prior probability (априорная вероятность из уверенности)
-        prior_prob = prior_confidence / 100.0  # 0-1
-        
-        # Bayesian update: P(win|signal) = likelihood × prior
-        # Упрощенная формула без нормализации (для ускорения)
-        posterior_prob = historical_win_rate * prior_prob
-        
-        # Если исторический WR низкий - снижаем уверенность
-        if historical_win_rate < 0.40:  # WR < 40%
-            posterior_prob *= 0.7  # Снижаем на 30%
-        
-        # Конвертируем обратно в проценты
-        posterior_confidence = posterior_prob * 100.0
-        
-        return max(0.0, min(95.0, posterior_confidence))
-    
-    def _calculate_expected_value(self, symbol: str, direction: str, confidence: float) -> float:
-        """
-        EXPECTED VALUE (EV) расчет: математическое ожидание прибыли
-        
-        EV = (Win Rate × Avg Win) - (Loss Rate × Avg Loss)
-        
-        Args:
-            symbol: Торговая пара
-            direction: Направление (LONG/SHORT)
-            confidence: Уверенность сигнала
-            
-        Returns:
-            Expected Value в долларах, или 0 если нет данных
-        """
-        if not self.learning_system:
-            return 0.0
-        
-        # Получаем статистику
-        stats = self.learning_system.stats.get(symbol, {}).get(direction)
-        if not stats or stats.total < 10:
-            # Если нет данных - используем оптимистичный EV на основе уверенности
-            # При уверенности 70% предполагаем WR 50% и R:R 1:2
-            estimated_win_rate = 0.50
-            estimated_avg_win = 2.50  # $2.50 при R:R 1:2
-            estimated_avg_loss = 1.25  # $1.25 (риск 0.5%)
-            ev = (estimated_win_rate * estimated_avg_win) - ((1 - estimated_win_rate) * estimated_avg_loss)
-            return ev
-        
-        # Реальный EV на основе исторических данных
-        win_rate = stats.win_rate / 100.0
-        
-        # Вычисляем avg_win и avg_loss из последних сделок
-        recent_trades = list(stats.recent_trades) if stats.recent_trades else []
-        winners = [t for t in recent_trades if t['pnl'] > 0]
-        losers = [t for t in recent_trades if t['pnl'] <= 0]
-        
-        avg_win = sum(t['pnl'] for t in winners) / len(winners) if winners else 2.50
-        avg_loss = abs(sum(t['pnl'] for t in losers) / len(losers)) if losers else 1.25
-        
-        # EV = (Win Rate × Avg Win) - (Loss Rate × Avg Loss)
-        ev = (win_rate * avg_win) - ((1 - win_rate) * avg_loss)
-        
-        return ev
-    
-    def update_factor_performance(self, factors: Dict[str, float], trade_result: bool):
-        """
-        Обновить производительность факторов после закрытия сделки
-        
-        Args:
-            factors: Словарь с оценками факторов {'wall': 75, 'spread': 80, ...}
-            trade_result: True если сделка прибыльная, False если убыточная
-        """
-        for factor_name, score in factors.items():
-            if factor_name in self.factor_performance:
-                self.factor_performance[factor_name]['total'] += 1
-                if trade_result:
-                    self.factor_performance[factor_name]['wins'] += 1
-        
-        # Адаптируем веса факторов каждые 20 сделок
-        total_trades = sum(perf['total'] for perf in self.factor_performance.values())
-        if total_trades >= 20 and total_trades % 20 == 0:
-            self._adapt_factor_weights()
-    
-    def _adapt_factor_weights(self):
-        """
-        АДАПТИВНЫЕ ВЕСА: динамически меняем веса факторов на основе их производительности
-        
-        Факторы с высоким win rate получают больший вес
-        Факторы с низким win rate получают меньший вес
-        """
-        # Вычисляем win rate для каждого фактора
-        factor_win_rates = {}
-        for factor_name, perf in self.factor_performance.items():
-            if perf['total'] >= 5:  # Минимум 5 сделок для оценки
-                factor_win_rates[factor_name] = perf['wins'] / perf['total']
-            else:
-                factor_win_rates[factor_name] = 0.5  # Нейтральный WR 50%
-        
-        if not factor_win_rates:
-            return
-        
-        # Нормализуем win rates (относительно среднего)
-        avg_win_rate = sum(factor_win_rates.values()) / len(factor_win_rates)
-        
-        # Вычисляем новые веса на основе относительной производительности
-        total_weight = 0
-        new_weights = {}
-        
-        for factor_name, win_rate in factor_win_rates.items():
-            # Относительная производительность (1.0 = средняя)
-            relative_performance = win_rate / avg_win_rate if avg_win_rate > 0 else 1.0
-            
-            # Новый вес = базовый вес × относительная производительность
-            base_weight = {
-                'wall': 0.35,
-                'spread': 0.25,
-                'imbalance': 0.20,
-                'aggression': 0.10,
-                'momentum': 0.05,
-                'fib': 0.05
-            }[factor_name]
-            
-            new_weights[factor_name] = base_weight * relative_performance
-            total_weight += new_weights[factor_name]
-        
-        # Нормализуем веса чтобы сумма была 1.0
-        if total_weight > 0:
-            for factor_name in new_weights:
-                new_weights[factor_name] /= total_weight
-                self.factor_weights[factor_name] = new_weights[factor_name]
-            
-            logger.info(f"🔄 Адаптированы веса факторов: {self.factor_weights}")
     
     def _wait_signal(self, symbol: str, reason: str) -> TradingSignal:
         """Создать WAIT сигнал"""

@@ -502,6 +502,24 @@ class TradingPrototype(QtWidgets.QMainWindow):
     
     # ========== DATA UPDATE METHODS ==========
     
+    def _on_close_button_clicked(self):
+        """Handle close button click - gets symbol from sender."""
+        button = self.sender()
+        if not button:
+            return
+        
+        # Get symbol from button property
+        symbol = button.property("symbol")
+        if not symbol:
+            return
+        
+        # Disable button immediately to prevent multiple clicks
+        button.setEnabled(False)
+        button.setText("...")
+        
+        # Emit signal to close position
+        self.positions_widget.closePositionRequested.emit(symbol)
+    
     def _handle_close_button(self, symbol: str):
         """Handle close button click - called directly from button."""
         self.positions_widget.closePositionRequested.emit(symbol)
@@ -605,24 +623,58 @@ class TradingPrototype(QtWidgets.QMainWindow):
             self.positions_widget.setItem(row, 8, QtWidgets.QTableWidgetItem(f"${position_value_usdt:,.2f}"))
             
             # Column 9: Close button
-            close_btn = QtWidgets.QPushButton("Закрыть")
-            close_btn.setCursor(QtGui.QCursor(QtCore.Qt.CursorShape.PointingHandCursor))
-            close_btn.setFocusPolicy(QtCore.Qt.FocusPolicy.NoFocus)
-            close_btn.setStyleSheet("""
-                QPushButton {
-                    background-color: #F6465D;
-                    color: white;
-                    border: none;
-                    border-radius: 3px;
-                    font-size: 10px;
-                    font-weight: 600;
-                    padding: 2px 6px;
-                    min-height: 17px;
-                    max-height: 17px;
-                }
-            """)
-            close_btn.clicked.connect(lambda checked=False, s=symbol: self._handle_close_button(s))
-            self.positions_widget.setCellWidget(row, 9, close_btn)
+            # Check if button already exists for this row
+            existing_widget = self.positions_widget.cellWidget(row, 9)
+            if existing_widget is None:
+                # Create container for centering
+                container = QtWidgets.QWidget()
+                container_layout = QtWidgets.QHBoxLayout(container)
+                container_layout.setContentsMargins(0, 0, 0, 0)
+                container_layout.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
+                
+                close_btn = QtWidgets.QPushButton("Закрыть")
+                close_btn.setCursor(QtGui.QCursor(QtCore.Qt.CursorShape.PointingHandCursor))
+                close_btn.setFocusPolicy(QtCore.Qt.FocusPolicy.NoFocus)
+                close_btn.setStyleSheet("""
+                    QPushButton {
+                        background-color: rgba(246, 70, 93, 0.12);
+                        color: #F6465D;
+                        border: 1px solid rgba(246, 70, 93, 0.35);
+                        border-radius: 3px;
+                        font-size: 9px;
+                        font-weight: 600;
+                        padding: 2px 6px;
+                        min-width: 40px;
+                        max-width: 40px;
+                        min-height: 16px;
+                        max-height: 16px;
+                    }
+                    QPushButton:hover {
+                        background-color: rgba(246, 70, 93, 0.22);
+                        border-color: rgba(246, 70, 93, 0.55);
+                    }
+                    QPushButton:pressed {
+                        background-color: rgba(246, 70, 93, 0.32);
+                    }
+                    QPushButton:disabled {
+                        background-color: rgba(107, 114, 128, 0.12);
+                        color: #8B949E;
+                        border-color: rgba(107, 114, 128, 0.25);
+                    }
+                """)
+                # Store symbol as property to avoid lambda issues
+                close_btn.setProperty("symbol", symbol)
+                close_btn.clicked.connect(self._on_close_button_clicked)
+                
+                container_layout.addWidget(close_btn)
+                self.positions_widget.setCellWidget(row, 9, container)
+            else:
+                # Update existing button's symbol property
+                close_btn = existing_widget.findChild(QtWidgets.QPushButton)
+                if close_btn:
+                    close_btn.setProperty("symbol", symbol)
+                    close_btn.setEnabled(True)  # Re-enable if it was disabled
+                    close_btn.setText("Закрыть")  # Reset text if it was changed
     
     def update_history_data(self, closed_trades: list):
         """Update history table."""

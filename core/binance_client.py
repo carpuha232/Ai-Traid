@@ -104,199 +104,148 @@ class BinanceRealtimeClient:
             except Exception as e:
                 logger.error(f"❌ Snapshot depth fetch failed for {symbol}: {e}")
         
-        # Launch streams
+        # Build ONE combined stream URL for all pairs (60 connections → 1)
+        stream_names = []
         for symbol in symbols:
-            # Depth stream (order book)
-            depth_task = asyncio.create_task(self._depth_stream(symbol))
-            self.tasks.append(depth_task)
-            
-            # Trade stream (trade feed)
-            trade_task = asyncio.create_task(self._trade_stream(symbol))
-            self.tasks.append(trade_task)
-            
-            # BookTicker (best bid/ask) — to monitor live spread
-            bt_task = asyncio.create_task(self._book_ticker_stream(symbol))
-            self.tasks.append(bt_task)
+            symbol_lower = symbol.lower()
+            stream_names.append(f"{symbol_lower}@depth20@100ms")
+            stream_names.append(f"{symbol_lower}@aggTrade")
+            stream_names.append(f"{symbol_lower}@bookTicker")
         
-        logger.info(f"🚀 Started {len(self.tasks)} WebSocket streams for {len(symbols)} pairs")
+        combined_url = f"wss://fstream.binance.com/stream?streams={'/'.join(stream_names)}"
+        combined_task = asyncio.create_task(self._combined_stream(combined_url, symbols))
+        self.tasks.append(combined_task)
+        
+        logger.info(f"🚀 Started 1 combined WebSocket for {len(symbols)} pairs (instead of {len(symbols)*3}!)")
     
-    def _futures_stream_url(self, stream_type: str, symbol_lower: str) -> str:
-        """Build the UM Futures WebSocket URL.
-
-        stream_type: 'depth' | 'aggtrade' | 'bookticker'
-        """
-        if stream_type == 'depth':
-            # Partial depth 20 levels, 100ms
-            return f"wss://fstream.binance.com/ws/{symbol_lower}@depth20@100ms"
-        if stream_type == 'aggtrade':
-            return f"wss://fstream.binance.com/ws/{symbol_lower}@aggTrade"
-        if stream_type == 'bookticker':
-            return f"wss://fstream.binance.com/ws/{symbol_lower}@bookTicker"
-        raise ValueError(f"Unknown stream_type: {stream_type}")
-
-    async def _depth_stream(self, symbol: str):
-        """Order book WebSocket stream."""
-        symbol_lower = symbol.lower()
-        url = self._futures_stream_url('depth', symbol_lower)
+    async def _combined_stream(self, url: str, symbols: List[str]):
+        """ONE WebSocket for ALL data (depth+trades+ticker)."""
+        retry_delay = 0.5
         while self.running:
             try:
-                async with websockets.connect(url, ping_interval=20, max_queue=100) as ws:
+                async with websockets.connect(url, ping_interval=10, max_queue=500) as ws:
+                    logger.info(f"✅ Combined stream connected")
+                    retry_delay = 0.5
+                    
                     while self.running:
                         raw = await ws.recv()
-                        payload = json.loads(raw) if isinstance(raw, (bytes, str)) else raw
-                        if not isinstance(payload, dict) or 'b' not in payload or 'a' not in payload:
+                        msg = json.loads(raw) if isinstance(raw, (bytes, str)) else raw
+                        
+                        if not isinstance(msg, dict) or 'stream' not in msg or 'data' not in msg:
                             continue
-                        state = self.book_state.get(symbol)
-                        if not state or not state.get('synced'):
-                            continue
+                        
+                        stream_name = msg['stream']
+                        payload = msg['data']
+                        symbol = stream_name.split('@')[0].upper()
+                        
+                        # Route to existing handlers (reuse code!)
                         try:
-                            U = payload.get('U')  # first update ID in event
-                            u = payload.get('u')  # final update ID in event
-                            pu = payload.get('pu')  # previous final update ID
-                            last_id = state.get('lastUpdateId') or 0
-                            # Sequence validation
-                            if pu is not None and last_id is not None and pu != last_id:
-                                raise ValueError(f"sequence gap: pu={pu}, last={last_id}")
-                            if u is not None and last_id is not None and u < last_id:
-                                continue  # stale event
+                            if 'depth' in stream_name:
+                                self._process_depth(symbol, payload)
+                            elif 'aggTrade' in stream_name:
+                                self._process_trade(symbol, payload)
+                            elif 'bookTicker' in stream_name:
+                                self._process_bookticker(symbol, payload)
                         except Exception as e:
-                            now_ts = time()
-                            # Throttle resyncs: max once every 2s and max 5 attempts
-                            if now_ts - self._last_resync_ts.get(symbol, 0.0) < 2.0 or self._resync_attempts.get(symbol, 0) >= 5:
-                                # Mark as unsynced, keep stream alive
-                                state['synced'] = False
-                                continue
-                            logger.warning(f"⚠️ Depth sequence warning {symbol}: {e}, resyncing")
-                            try:
-                                if self.session is None:
-                                    logger.error(f"❌ Session not initialised for {symbol}")
-                                    state['synced'] = False
-                                    await asyncio.sleep(1)
-                                    continue
-                                async with self.session.get(
-                                    "https://fapi.binance.com/fapi/v1/depth",
-                                    params={"symbol": symbol, "limit": 1000},
-                                    timeout=aiohttp.ClientTimeout(total=5)
-                                ) as resp:
-                                    resp.raise_for_status()
-                                    snapshot = await resp.json()
-                                    last_id = snapshot.get('lastUpdateId')
-                                    bids = {float(p): float(q) for p, q in snapshot.get('bids', [])}
-                                    asks = {float(p): float(q) for p, q in snapshot.get('asks', [])}
-                                    self.book_state[symbol] = {'bids': bids, 'asks': asks, 'lastUpdateId': last_id, 'synced': True}
-                                    # Refresh top-20 for UI
-                                    top_bids = [[p, bids[p]] for p in sorted(bids.keys(), reverse=True)[:20]]
-                                    top_asks = [[p, asks[p]] for p in sorted(asks.keys())[:20]]
-                                    self.orderbooks[symbol] = {'bids': top_bids, 'asks': top_asks, 'timestamp': 0}
-                                    self._last_resync_ts[symbol] = now_ts
-                                    self._resync_attempts[symbol] = 0
-                                    logger.info(f"✅ Resync completed for {symbol}")
-                            except Exception as ee:
-                                self._resync_attempts[symbol] = self._resync_attempts.get(symbol, 0) + 1
-                                logger.error(f"❌ Resync failed for {symbol} ({self._resync_attempts[symbol]}): {ee}")
-                                state['synced'] = False
-                                continue
-                        # Apply deltas
-                        bids_map = state['bids']
-                        asks_map = state['asks']
-                        for p, q in payload['b']:
-                            price = float(p); qty = float(q)
-                            if qty == 0.0:
-                                bids_map.pop(price, None)
-                            else:
-                                bids_map[price] = qty
-                        for p, q in payload['a']:
-                            price = float(p); qty = float(q)
-                            if qty == 0.0:
-                                asks_map.pop(price, None)
-                            else:
-                                asks_map[price] = qty
-                        state['lastUpdateId'] = payload.get('u', state.get('lastUpdateId'))
-                        # Rebuild top-20
-                        top_bids = [[p, bids_map[p]] for p in sorted(bids_map.keys(), reverse=True)[:20]]
-                        top_asks = [[p, asks_map[p]] for p in sorted(asks_map.keys())[:20]]
-                        ob = {'bids': top_bids, 'asks': top_asks, 'timestamp': payload.get('E') or payload.get('T') or 0}
-                        self.orderbooks[symbol] = ob
-                        # Update mid price
-                        if top_bids and top_asks:
-                            best_bid = top_bids[0][0]
-                            best_ask = top_asks[0][0]
-                            mid_price = (best_bid + best_ask) / 2
-                            if mid_price > 0:
-                                self.prices[symbol] = mid_price
-                                self.price_ts[symbol] = time()
-                        for callback in self.orderbook_callbacks:
-                            try:
-                                await callback(symbol, ob)
-                            except Exception as e:
-                                logger.error(f"Orderbook callback error: {e}")
+                            logger.debug(f"Process error {symbol}: {e}")
+                            
             except Exception as e:
-                logger.error(f"❌ Depth stream error for {symbol}: {e}")
-                await asyncio.sleep(0.5)
-    
-    async def _trade_stream(self, symbol: str):
-        """Trade tape WebSocket stream."""
-        symbol_lower = symbol.lower()
-        url = self._futures_stream_url('aggtrade', symbol_lower)
-        while self.running:
-            try:
-                async with websockets.connect(url, ping_interval=20, max_queue=100) as ws:
-                    while self.running:
-                        raw = await ws.recv()
-                        payload = json.loads(raw) if isinstance(raw, (bytes, str)) else raw
-                        if not isinstance(payload, dict) or 'p' not in payload or 'T' not in payload or 'q' not in payload:
-                            continue
-                        try:
-                            price_val = float(payload['p'])
-                            qty_val = float(payload['q'])
-                            ts_val = int(payload['T'])
-                        except Exception:
-                            continue
-                        if price_val <= 0 or qty_val <= 0:
-                            continue
-                        trade = {
-                            'symbol': symbol,
-                            'price': price_val,
-                            'quantity': qty_val,
-                            'time': ts_val,
-                            'is_buyer_maker': payload.get('m', False)
-                        }
-                        self.trades[symbol].append(trade)
-                        self.prices[symbol] = trade['price']
-                        self.price_ts[symbol] = time()
-                        for callback in self.trade_callbacks:
-                            try:
-                                await callback(symbol, trade)
-                            except Exception as e:
-                                logger.error(f"Trade callback error: {e}")
-            except Exception as e:
-                logger.error(f"❌ Trade stream error for {symbol}: {e}")
-                await asyncio.sleep(0.5)
+                if self.running:
+                    logger.error(f"❌ Combined stream disconnected: {e}")
+                    await asyncio.sleep(retry_delay)
+                    retry_delay = min(retry_delay * 2, 10)
 
-    async def _book_ticker_stream(self, symbol: str):
-        """UM Futures best bid/ask stream (bookTicker)."""
-        symbol_lower = symbol.lower()
-        url = self._futures_stream_url('bookticker', symbol_lower)
-        while self.running:
-            try:
-                async with websockets.connect(url, ping_interval=20, max_queue=100) as ws:
-                    while self.running:
-                        raw = await ws.recv()
-                        payload = json.loads(raw) if isinstance(raw, (bytes, str)) else raw
-                        if not isinstance(payload, dict):
-                            continue
-                        try:
-                            best_bid = float(payload.get('b', 0.0))
-                            best_ask = float(payload.get('a', 0.0))
-                            ts_val = float(payload.get('T', 0)) or time()
-                        except Exception:
-                            continue
-                        if best_bid <= 0 or best_ask <= 0:
-                            continue
-                        self.book_ticker[symbol] = {'bid': best_bid, 'ask': best_ask, 'ts': ts_val}
-            except Exception as e:
-                logger.error(f"❌ BookTicker stream error for {symbol}: {e}")
-                await asyncio.sleep(0.5)
+    def _process_depth(self, symbol: str, payload: dict):
+        """Process depth update (orderbook). Extracted from _depth_stream."""
+        if not isinstance(payload, dict) or 'b' not in payload or 'a' not in payload:
+            return
+        state = self.book_state.get(symbol)
+        if not state or not state.get('synced'):
+            return
+        
+        # Sequence validation
+        try:
+            U = payload.get('U')
+            u = payload.get('u')
+            pu = payload.get('pu')
+            last_id = state.get('lastUpdateId') or 0
+            if pu is not None and last_id is not None and pu != last_id:
+                raise ValueError(f"sequence gap")
+            if u is not None and last_id is not None and u < last_id:
+                return  # stale
+        except Exception:
+            state['synced'] = False
+            return
+        
+        # Apply deltas
+        bids_map = state['bids']
+        asks_map = state['asks']
+        for p, q in payload['b']:
+            price = float(p); qty = float(q)
+            if qty == 0.0:
+                bids_map.pop(price, None)
+            else:
+                bids_map[price] = qty
+        for p, q in payload['a']:
+            price = float(p); qty = float(q)
+            if qty == 0.0:
+                asks_map.pop(price, None)
+            else:
+                asks_map[price] = qty
+        state['lastUpdateId'] = payload.get('u', state.get('lastUpdateId'))
+        
+        # Rebuild top-20
+        top_bids = [[p, bids_map[p]] for p in sorted(bids_map.keys(), reverse=True)[:20]]
+        top_asks = [[p, asks_map[p]] for p in sorted(asks_map.keys())[:20]]
+        ob = {'bids': top_bids, 'asks': top_asks, 'timestamp': payload.get('E') or payload.get('T') or 0}
+        self.orderbooks[symbol] = ob
+        
+        # Update mid price
+        if top_bids and top_asks:
+            best_bid = top_bids[0][0]
+            best_ask = top_asks[0][0]
+            mid_price = (best_bid + best_ask) / 2
+            if mid_price > 0:
+                self.prices[symbol] = mid_price
+                self.price_ts[symbol] = time()
+    
+    def _process_trade(self, symbol: str, payload: dict):
+        """Process trade update. Extracted from _trade_stream."""
+        if not isinstance(payload, dict) or 'p' not in payload or 'T' not in payload or 'q' not in payload:
+            return
+        try:
+            price_val = float(payload['p'])
+            qty_val = float(payload['q'])
+            ts_val = int(payload['T'])
+        except Exception:
+            return
+        if price_val <= 0 or qty_val <= 0:
+            return
+        
+        trade = {
+            'symbol': symbol,
+            'price': price_val,
+            'quantity': qty_val,
+            'time': ts_val,
+            'is_buyer_maker': payload.get('m', False)
+        }
+        self.trades[symbol].append(trade)
+        self.prices[symbol] = trade['price']
+        self.price_ts[symbol] = time()
+    
+    def _process_bookticker(self, symbol: str, payload: dict):
+        """Process bookTicker update. Extracted from _book_ticker_stream."""
+        if not isinstance(payload, dict):
+            return
+        try:
+            best_bid = float(payload.get('b', 0.0))
+            best_ask = float(payload.get('a', 0.0))
+            ts_val = float(payload.get('T', 0)) or time()
+        except Exception:
+            return
+        if best_bid <= 0 or best_ask <= 0:
+            return
+        self.book_ticker[symbol] = {'bid': best_bid, 'ask': best_ask, 'ts': ts_val}
     
     def get_orderbook(self, symbol: str) -> Dict:
         """Return the current order book snapshot."""

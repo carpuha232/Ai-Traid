@@ -5,7 +5,6 @@
 
 import asyncio
 import logging
-import tkinter as tk
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Optional
@@ -81,18 +80,6 @@ class BotCore:
     
     def _handle_closed_trade(self, closed_trade):
         """Handle closed trade bookkeeping."""
-        signal = self.bot.current_signals.get(closed_trade.symbol)
-        if signal and hasattr(signal, 'direction') and signal.direction != 'WAIT':
-            factors = {
-                'wall': getattr(signal, 'wall_score', 50),
-                'spread': getattr(signal, 'spread_score', 50),
-                'imbalance': getattr(signal, 'imbalance_score', 50),
-                'aggression': getattr(signal, 'aggression_score', 50),
-                'momentum': getattr(signal, 'momentum_score', 50),
-                'fib': getattr(signal, 'fib_score', 50)
-            }
-            self.bot.signal_analyzer.update_factor_performance(factors, closed_trade.pnl > 0)
-        
         # Refresh GUI
         self._update_gui_after_close(closed_trade)
         
@@ -190,8 +177,6 @@ class BotCore:
                     
                     # Ensure there is no open position already
                     if symbol not in self.bot.paper_trader.positions:
-                        # Adaptive learning removed - always allow trading
-                        
                         # Calculate priority
                         expected_profit_percent = abs(
                             signal.take_profit_1 - signal.entry_price
@@ -294,7 +279,6 @@ class BotCore:
                         self.bot.connection_stats.get('reconnects', 0),
                         last_error
                     )
-            # Adaptive learning removed
             if self.bot.config['logging']['save_session']:
                 filename = f"results/autosave_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
                 Path("results").mkdir(exist_ok=True)

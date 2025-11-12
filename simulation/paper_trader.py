@@ -63,7 +63,7 @@ class ClosedTrade:
     pnl: float
     pnl_percent: float
     close_reason: str  # 'Take Profit', 'Stop Loss', 'Manual', 'Timeout'
-    total_commission: float
+    total_commission: float = 0.0
     confidence: float = 75.0  # Уверенность сигнала при входе
 
 
