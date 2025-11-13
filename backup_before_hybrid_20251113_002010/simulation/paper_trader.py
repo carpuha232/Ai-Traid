@@ -46,7 +46,6 @@ class Position:
     # Advanced Risk Management
     initial_margin: float = 0.0  # Начальная маржа (для расчета доливок)
     initial_entry_price: float = 0.0  # Первоначальная цена входа
-    initial_size: float = 0.0  # Начальный размер позиции (для мартингейла)
     averaging_count: int = 0  # Количество доливок
     total_margin: float = 0.0  # Общая маржа после доливок
     averaging_order_id: Optional[str] = None  # ID активного ордера на доливку
@@ -59,24 +58,6 @@ class Position:
     # Protected Position Tracking
     is_protected: bool = False  # Позиция защищена (стоп-лосс в +10% установлен)
     protection_activated_at: Optional[float] = None  # PNL % когда активировалась защита
-    
-    # Protective Order (Emergency close near liquidation)
-    protective_order_id: Optional[str] = None  # ID защитного ордера
-    protective_order_active: bool = False  # Активен ли защитный ордер
-    
-    # Limit Stop with Hysteresis (ROI 0-10%)
-    limit_stop_active: bool = False  # Активен ли гистерезисный стоп
-    limit_stop_peak_price: float = 0.0  # Пиковая цена для гистерезиса
-    limit_stop_order_id: Optional[str] = None  # ID гистерезисного стоп-ордера
-    
-    # Tracking for triggers
-    last_liquidation_price: Optional[float] = None  # Последняя известная цена ликвидации
-    last_update_price: Optional[float] = None  # Последняя цена при обновлении ордеров
-    
-    # Emergency Stop (ROI -85% protection)
-    emergency_stop_active: bool = False  # Активен ли аварийный стоп
-    emergency_stop_order_id: Optional[str] = None  # ID аварийного стоп-ордера
-    emergency_stop_level_roi: float = -85.0  # Уровень срабатывания в ROI%
 
 
 @dataclass

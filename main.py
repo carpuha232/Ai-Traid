@@ -9,6 +9,7 @@ import logging
 import sys
 import traceback
 import threading
+import os
 from pathlib import Path
 from datetime import datetime
 
@@ -36,26 +37,56 @@ def global_exception_handler(exc_type, exc_value, exc_traceback):
         try:
             logger.error(f"❌ Unhandled exception: {error_msg}", exc_info=False)
         except:
-            print(f"❌ Unhandled exception (logger unavailable): {error_msg}")
+            # If logger is unavailable, try to write to file directly
+            try:
+                with open('logs/error.log', 'a', encoding='utf-8') as f:
+                    f.write(f"{datetime.now()} - ERROR - Unhandled exception: {error_msg}\n")
+            except:
+                pass  # If even file write fails, silently ignore
         
-        print(f"❌ Unhandled exception: {exc_type.__name__}: {exc_value}")
-        print("See log file for details.")
+        # All output goes to logger/file, no print() to prevent console windows
+        try:
+            logger.error(f"❌ Unhandled exception: {exc_type.__name__}: {exc_value}")
+            logger.error("See log file for details.")
+        except:
+            pass
     except Exception as e:
-        print(f"❌ Critical failure while handling exception: {e}")
-        print(f"Original error: {exc_type.__name__}: {exc_value}")
+        try:
+            logger.error(f"❌ Critical failure while handling exception: {e}")
+            logger.error(f"Original error: {exc_type.__name__}: {exc_value}")
+        except:
+            # Last resort: write to error log file
+            try:
+                with open('logs/error.log', 'a', encoding='utf-8') as f:
+                    f.write(f"{datetime.now()} - ERROR - Critical failure: {e}\n")
+                    f.write(f"{datetime.now()} - ERROR - Original: {exc_type.__name__}: {exc_value}\n")
+            except:
+                pass
 
 sys.excepthook = global_exception_handler
 
 # Logging setup
+# IMPORTANT: Use config.json for log level, disable StreamHandler to prevent console windows
+# Load config first to get log level
+try:
+    import json
+    with open('config.json', 'r', encoding='utf-8') as f:
+        config_data = json.load(f)
+    log_level_str = config_data.get('logging', {}).get('level', 'INFO')
+    log_level = getattr(logging, log_level_str.upper(), logging.INFO)
+except:
+    log_level = logging.INFO
+
 logging.basicConfig(
-    level=logging.INFO,  # Changed from DEBUG to INFO
+    level=log_level,  # Use level from config.json
     format='%(asctime)s - %(levelname)s - %(message)s',
     handlers=[
-        logging.FileHandler(f'logs/bot_{datetime.now().strftime("%Y%m%d_%H%M%S")}.log', encoding='utf-8'),
-        logging.StreamHandler()
+        logging.FileHandler(f'logs/bot_{datetime.now().strftime("%Y%m%d_%H%M%S")}.log', encoding='utf-8')
+        # StreamHandler removed to prevent console windows
     ]
 )
 logger = logging.getLogger(__name__)
+# Reduce noise from third-party libraries
 logging.getLogger('websockets').setLevel(logging.WARNING)
 logging.getLogger('aiohttp').setLevel(logging.WARNING)
 logging.getLogger('binance').setLevel(logging.WARNING)
@@ -74,23 +105,33 @@ class AutoScalpingBot:
             logger.info("🤖 AUTO SCALPING BOT - CONSOLIDATED RELEASE")
             logger.info("="*60)
             
-            if self.config['api']['key'] == "INSERT_YOUR_API_KEY_HERE":
+            # Check API keys only for live trading mode
+            self.mode = self.config.get('mode', 'paper_trading')
+            if self.mode == 'live_trading' and self.config['api']['key'] == "INSERT_YOUR_API_KEY_HERE":
                 logger.error("❌ API keys are not configured! Update config.json.")
                 raise ValueError("API keys are not configured")
+            elif self.mode == 'paper_trading':
+                logger.info("📊 Running in PAPER TRADING mode (demo)")
+            elif self.mode == 'live_trading':
+                logger.info("🚀 Running in LIVE TRADING mode")
+            
+            # Log Testnet status
+            if self.config.get('api', {}).get('testnet', False):
+                logger.info("🧪 Using Binance TESTNET (demo funds)")
         except Exception as e:
             logger.error(f"❌ Bot initialisation failed: {e}", exc_info=True)
             raise
         
         # Component setup
-        self.binance_client = BinanceRealtimeClient(
-            self.config['api']['key'],
-            self.config['api']['secret']
-        )
+        api_key = self.config['api']['key']
+        api_secret = self.config['api']['secret']
+        testnet = self.config.get('api', {}).get('testnet', False)
+        
+        self.binance_client = BinanceRealtimeClient(api_key, api_secret, testnet=testnet)
         
         self.signal_analyzer = SignalAnalyzer(self.config)
         self.signal_analyzer.set_trading_mode("Moderate")
 
-        self.mode = self.config.get('mode', 'paper_trading')
         if self.mode == 'live_trading':
             self.paper_trader = LiveTrader(
                 self.config,
@@ -112,7 +153,7 @@ class AutoScalpingBot:
         # State
         self.running = False
         self.paused = False  # For "Pause" button
-        self.pairs = self.config['pairs']
+        self.pairs = self.config.get('pairs', self.config.get('signals', {}).get('pairs', []))
         self.current_signals = {}
         self._last_signal_log = None
         self.connection_stats = {
@@ -162,10 +203,337 @@ class AutoScalpingBot:
         status = "PAUSED" if self.paused else "RESUMED"
         logger.info(f"⏸️ Bot {status} - new positions: {'DISABLED' if self.paused else 'ENABLED'}")
     
+    def _monitor_position_protection(self):
+        """Monitor positions - simplified: Averaging in loss, Stepped Stop in profit."""
+        if self.mode != 'live_trading':
+            return
+        
+        # Periodically cleanup orphaned/duplicate orders (every 15 seconds to reduce API calls)
+        if not hasattr(self, '_last_cleanup_time'):
+            self._last_cleanup_time = datetime.now()
+        
+        cleanup_interval = self.config.get('risk', {}).get('protective_refresh_interval', 15.0)  # Use config interval
+        if (datetime.now() - self._last_cleanup_time).total_seconds() >= cleanup_interval:
+            try:
+                # paper_trader is LiveTrader in live_trading mode
+                if hasattr(self.paper_trader, 'client') and hasattr(self.paper_trader, '_cleanup_orphaned_orders'):
+                    open_orders = self.paper_trader.client.futures_get_open_orders(recvWindow=60000)
+                    logger.info(f"🧹 Periodic cleanup: Found {len(open_orders)} open orders")
+                    orders_by_symbol = {}
+                    for order in open_orders:
+                        symbol = order['symbol']
+                        if symbol not in orders_by_symbol:
+                            orders_by_symbol[symbol] = []
+                        orders_by_symbol[symbol].append(order)
+                    self.paper_trader._cleanup_orphaned_orders(open_orders, orders_by_symbol)
+                    self._last_cleanup_time = datetime.now()
+            except Exception as e:
+                logger.warning(f"⚠️ Cleanup error: {e}")
+        
+        if not hasattr(self.paper_trader, 'risk_manager'):
+            return
+        
+        risk_manager = self.paper_trader.risk_manager
+        
+        # IMPORTANT: Get positions dict reference directly (not a copy)
+        # This ensures we're working with the same objects that were updated by refresh_all_positions()
+        positions_dict = self.paper_trader.positions
+        
+        for symbol, position in positions_dict.items():
+            # Skip if no PNL data
+            if not hasattr(position, 'unrealized_pnl_percent'):
+                logger.debug(f"⏭️ {symbol}: Skipping - no unrealized_pnl_percent attribute")
+                continue
+            
+            pnl_pct = position.unrealized_pnl_percent
+            logger.info(f"🔍 {symbol}: Checking protection - ROI={pnl_pct:.2f}%")
+            
+            # ═══════════════════════════════════════════════════════
+            # MODE 1: LOSS (ROI < 0) - Martingale Averaging
+            # ═══════════════════════════════════════════════════════
+            if pnl_pct < 0:
+                # Cancel trailing stop if going back to loss
+                if position.stepped_stop_active and position.stepped_stop_order_id:
+                    if risk_manager.cancel_order(symbol, position.stepped_stop_order_id):
+                        logger.info(f"🔄 {symbol}: Trailing stop canceled (ROI < 0%)")
+                        position.stepped_stop_active = False
+                        position.stepped_stop_order_id = None
+                        position.is_protected = False
+                
+                # Cancel any old Emergency Stop orders (legacy - we don't use them anymore)
+                # Check for STOP orders with ROI around -85% (old emergency stop logic)
+                try:
+                    open_orders = risk_manager.client.futures_get_open_orders(symbol=symbol, recvWindow=60000)
+                    order_side = 'SELL' if position.side == 'LONG' else 'BUY'
+                    for order in open_orders:
+                        order_type = order.get('type')
+                        if order_type in ['STOP', 'STOP_MARKET'] and order.get('side') == order_side:
+                            order_id = str(order.get('orderId', ''))
+                            stop_price = float(order.get('stopPrice', 0))
+                            if stop_price > 0:
+                                # Calculate ROI for this stop price
+                                if position.side == 'LONG':
+                                    stop_roi = ((stop_price - position.entry_price) / position.entry_price) * 100 * position.leverage
+                                else:
+                                    stop_roi = ((position.entry_price - stop_price) / position.entry_price) * 100 * position.leverage
+                                
+                                # If ROI is around -85%, it's an old emergency stop - cancel it
+                                if abs(stop_roi - (-85.0)) < 5.0:  # Within 5% of -85%
+                                    try:
+                                        risk_manager.client.futures_cancel_order(symbol=symbol, orderId=order_id)
+                                        logger.info(f"🗑️ {symbol}: Canceled old Emergency Stop order {order_id} (legacy, ROI={stop_roi:.1f}%)")
+                                    except Exception as e:
+                                        logger.debug(f"Failed to cancel old emergency stop {order_id}: {e}")
+                except Exception as e:
+                    logger.debug(f"Error checking for old emergency stops: {e}")
+                
+                # Ensure averaging order is active (Martingale)
+                # Always try to place averaging order - place_averaging_order will cancel old ones
+                # Check if position size is valid for averaging
+                initial_size = getattr(position, 'initial_size', position.size)
+                if initial_size <= 0:
+                    logger.debug(f"⏸️ {symbol}: Skipping averaging order - position size too small ({initial_size:.6f})")
+                else:
+                    current_liq = risk_manager.calculate_liquidation_price(
+                        entry_price=position.entry_price,
+                        side=position.side,
+                        leverage=position.leverage
+                    )
+                    
+                    # Get available balance for margin check
+                    available_balance = None
+                    if hasattr(self.paper_trader, 'get_available_balance'):
+                        try:
+                            available_balance = self.paper_trader.get_available_balance()
+                        except:
+                            pass
+                    
+                    # Check if current averaging order still exists and is valid
+                    averaging_order_valid = False
+                    # IMPORTANT: Check hasattr first, then check if value is not None/empty
+                    has_averaging_id = hasattr(position, 'averaging_order_id') and position.averaging_order_id
+                    logger.debug(f"🔍 {symbol}: Averaging order check - has_averaging_id={has_averaging_id}, value={getattr(position, 'averaging_order_id', None)}")
+                    
+                    if has_averaging_id:
+                        logger.debug(f"🔍 {symbol}: Checking averaging order {position.averaging_order_id}")
+                        try:
+                            order_info = risk_manager.client.futures_get_order(
+                                symbol=symbol,
+                                orderId=position.averaging_order_id
+                            )
+                            if order_info and order_info.get('status') in ['NEW', 'PARTIALLY_FILLED']:
+                                logger.debug(f"✅ {symbol}: Averaging order {position.averaging_order_id} found with status: {order_info.get('status')}")
+                                averaging_order_valid = True
+                                logger.info(f"✅ {symbol}: Averaging order {position.averaging_order_id} is valid, skipping placement")
+                        except Exception as e:
+                            # Order doesn't exist or was filled
+                            logger.info(f"⚠️ {symbol}: Averaging order {position.averaging_order_id} check failed: {e}, will recreate")
+                            position.averaging_order_id = None
+                    
+                    # Only place new order if current one doesn't exist or is invalid
+                    if not averaging_order_valid:
+                        order_id = risk_manager.place_averaging_order(
+                            position=position,
+                            liquidation_price=current_liq,
+                            available_balance=available_balance
+                        )
+                        if order_id:
+                            # Cancel old averaging order if it's different
+                            if hasattr(position, 'averaging_order_id') and position.averaging_order_id and position.averaging_order_id != order_id:
+                                if risk_manager.cancel_order(symbol, position.averaging_order_id):
+                                    logger.info(f"🗑️ {symbol}: Old averaging order {position.averaging_order_id} canceled (replaced with {order_id})")
+                            position.averaging_order_id = order_id
+                            logger.info(
+                                f"🎯 {symbol}: Averaging order #{position.averaging_count + 1} placed "
+                                f"@ 15% from liquidation (Martingale) - Order ID: {order_id}"
+                            )
+                            logger.debug(f"💾 {symbol}: Saved averaging_order_id={order_id} to position")
+                        # If order_id is None, don't log - already logged in place_averaging_order
+                    else:
+                        # Averaging order is valid, no need to place new one
+                        logger.debug(f"✅ {symbol}: Averaging order {position.averaging_order_id} is valid, no action needed")
+            
+            # ═══════════════════════════════════════════════════════
+            # MODE 2: SMALL PROFIT (0% ≤ ROI < activation_pnl%) - Cancel Averaging
+            # ═══════════════════════════════════════════════════════
+            else:
+                # Get activation PNL from config (default 20%)
+                activation_pnl = risk_manager.config.get('risk', {}).get('stepped_stop_activation_pnl', 20.0)
+                
+                # Cancel any old Emergency Stop orders (legacy - we don't use them anymore)
+                # Check for STOP orders with ROI around -85% (old emergency stop logic)
+                try:
+                    open_orders = risk_manager.client.futures_get_open_orders(symbol=symbol, recvWindow=60000)
+                    order_side = 'SELL' if position.side == 'LONG' else 'BUY'
+                    for order in open_orders:
+                        order_type = order.get('type')
+                        if order_type in ['STOP', 'STOP_MARKET'] and order.get('side') == order_side:
+                            order_id = str(order.get('orderId', ''))
+                            stop_price = float(order.get('stopPrice', 0))
+                            if stop_price > 0:
+                                # Calculate ROI for this stop price
+                                if position.side == 'LONG':
+                                    stop_roi = ((stop_price - position.entry_price) / position.entry_price) * 100 * position.leverage
+                                else:
+                                    stop_roi = ((position.entry_price - stop_price) / position.entry_price) * 100 * position.leverage
+                                
+                                # If ROI is around -85%, it's an old emergency stop - cancel it
+                                if abs(stop_roi - (-85.0)) < 5.0:  # Within 5% of -85%
+                                    try:
+                                        risk_manager.client.futures_cancel_order(symbol=symbol, orderId=order_id)
+                                        logger.info(f"🗑️ {symbol}: Canceled old Emergency Stop order {order_id} (legacy, ROI={stop_roi:.1f}%)")
+                                    except Exception as e:
+                                        logger.debug(f"Failed to cancel old emergency stop {order_id}: {e}")
+                except Exception as e:
+                    logger.debug(f"Error checking for old emergency stops: {e}")
+                
+                if 0 <= pnl_pct < activation_pnl:
+                    # ROI is positive but below activation threshold
+                    logger.debug(f"📊 {symbol}: ROI={pnl_pct:.2f}% is in range [0%, {activation_pnl}%) - no trailing stop yet")
+                    # Cancel averaging when in profit
+                    if position.averaging_order_id:
+                        if risk_manager.cancel_order(symbol, position.averaging_order_id):
+                            logger.info(f"🔄 {symbol}: Averaging order canceled (in profit)")
+                        position.averaging_order_id = None
+                    
+                    # Cancel any trailing stop that might exist (shouldn't, but safety check)
+                    if position.stepped_stop_active and position.stepped_stop_order_id:
+                        if risk_manager.cancel_order(symbol, position.stepped_stop_order_id):
+                            logger.info(f"🔄 {symbol}: Trailing stop canceled (ROI < {activation_pnl}%)")
+                        position.stepped_stop_active = False
+                        position.stepped_stop_order_id = None
+                        position.is_protected = False
+                    
+                    # No protection until activation_pnl% PNL
+                    # Trailing stop will activate at activation_pnl%
+                    continue
+                
+                # ═══════════════════════════════════════════════════════
+                # MODE 3: TRAILING STOP (ROI ≥ activation_pnl%) - Maximum Profit
+                # ═══════════════════════════════════════════════════════
+                # pnl_pct >= activation_pnl
+                logger.info(f"🎯 {symbol}: Entering MODE 3 - ROI={pnl_pct:.2f}% >= activation_pnl={activation_pnl}%")
+                
+                # Cancel averaging permanently when entering protected mode
+                if position.averaging_order_id:
+                    if risk_manager.cancel_order(symbol, position.averaging_order_id):
+                        logger.info(f"🗑️ {symbol}: Averaging order canceled (trailing stop activated)")
+                    position.averaging_order_id = None
+                
+                # Calculate trailing stop level
+                target_stop_pnl = risk_manager.calculate_progressive_stop_level(pnl_pct)
+                
+                if target_stop_pnl is None:
+                    logger.warning(f"⚠️ {symbol}: calculate_progressive_stop_level returned None for PNL={pnl_pct:.2f}% (activation_pnl={activation_pnl}%)")
+                    continue
+                
+                logger.info(f"🛡️ {symbol}: Calculated trailing stop level: {target_stop_pnl:.1f}% (current PNL={pnl_pct:.2f}%)")
+                
+                # Mark as protected on first activation
+                if not position.is_protected:
+                    position.is_protected = True
+                    position.protection_activated_at = pnl_pct
+                    logger.info(f"✅ {symbol}: TRAILING STOP ACTIVATED at PNL={pnl_pct:.1f}% (stop @ +{target_stop_pnl:.1f}%)")
+                
+                # Check if stop level needs updating
+                # IMPORTANT: Trailing stop can only move UP, never DOWN
+                current_stop_pnl = position.stepped_stop_level_pnl if position.stepped_stop_active else 0.0
+                
+                # Only update if: no stop exists OR new stop is HIGHER than current
+                # NEVER update if new stop is LOWER - keep current stop active!
+                if not position.stepped_stop_active:
+                    # No stop exists, place first one
+                    logger.info(
+                        f"🛡️ {symbol}: PNL={pnl_pct:.1f}% → Placing trailing stop @ +{target_stop_pnl:.1f}%"
+                    )
+                    
+                    new_order_id = risk_manager.place_progressive_stop_order(
+                        position=position,
+                        stop_pnl_pct=target_stop_pnl
+                    )
+                    
+                    if new_order_id:
+                        position.stepped_stop_active = True
+                        position.stepped_stop_level_pnl = target_stop_pnl
+                        position.stepped_stop_order_id = new_order_id
+                        
+                elif target_stop_pnl > current_stop_pnl:
+                    # New stop is HIGHER - update (trailing stop moves up)
+                    logger.info(
+                        f"🛡️ {symbol}: PNL={pnl_pct:.1f}% → Raising trailing stop from +{current_stop_pnl:.1f}% to +{target_stop_pnl:.1f}%"
+                    )
+                    
+                    # ВАЖНО: place_progressive_stop_order уже ставит новый ордер первым, потом удаляет старый
+                    new_order_id = risk_manager.place_progressive_stop_order(
+                        position=position,
+                        stop_pnl_pct=target_stop_pnl
+                    )
+                    
+                    if new_order_id:
+                        # Update position state
+                        position.stepped_stop_level_pnl = target_stop_pnl
+                        position.stepped_stop_order_id = new_order_id
+                        
+                else:
+                    # target_stop_pnl <= current_stop_pnl
+                    # PNL dropped or same - KEEP current stop active (DO NOT UPDATE!)
+                    # This is trailing stop behavior - stop only moves up, never down
+                    logger.debug(
+                        f"🛡️ {symbol}: PNL={pnl_pct:.1f}% → Keeping stop @ +{current_stop_pnl:.1f}% "
+                        f"(calculated would be +{target_stop_pnl:.1f}%, but trailing stop only moves up)"
+                    )
+                    # DO NOTHING - current stop remains active and will trigger if price reaches it
+    
     def _on_window_close(self):
         """Handle GUI window close."""
-        logger.info("⏹️ GUI window closed by user")
+        logger.info("GUI window closed by user")
         self.running = False
+        
+        # ALWAYS remove lock file on close (with retries)
+        lock_file = Path("bot.lock")
+        max_attempts = 10
+        for attempt in range(max_attempts):
+            try:
+                if lock_file.exists():
+                    lock_file.unlink()
+                    logger.info("Lock file removed successfully")
+                    break
+            except Exception as e:
+                if attempt < max_attempts - 1:
+                    import time
+                    time.sleep(0.2)  # Wait 200ms before retry
+                else:
+                    logger.warning(f"Could not remove lock file after {max_attempts} attempts: {e}")
+                    # Try one more time with force
+                    try:
+                        if lock_file.exists():
+                            import os
+                            os.remove(lock_file)
+                            logger.info("Lock file force-removed")
+                    except:
+                        pass
+        
+        # Stop asyncio operations gracefully
+        try:
+            if hasattr(self, 'binance_client') and self.binance_client:
+                # Stop WebSocket connections
+                loop = None
+                try:
+                    loop = asyncio.get_event_loop()
+                except RuntimeError:
+                    loop = asyncio.new_event_loop()
+                    asyncio.set_event_loop(loop)
+                
+                if loop and not loop.is_closed():
+                    # Schedule stop in asyncio loop
+                    if loop.is_running():
+                        asyncio.run_coroutine_threadsafe(self.binance_client.stop(), loop)
+                    else:
+                        loop.run_until_complete(self.binance_client.stop())
+        except Exception as e:
+            logger.warning(f"⚠️ Error stopping connections: {e}")
+        
+        # Quit Qt application
         if self.app:
             self.app.quit()
     
@@ -173,10 +541,15 @@ class AutoScalpingBot:
         """Handle connection button toggle."""
         if connected:
             logger.info("🔄 Starting bot from GUI...")
-            # Start bot if not running
+            # Start bot if not running and asyncio thread doesn't exist
             if not self.running:
-                asyncio_thread = threading.Thread(target=self._asyncio_thread, daemon=True)
-                asyncio_thread.start()
+                # Check if asyncio thread already exists
+                existing_threads = [t for t in threading.enumerate() if hasattr(t, 'name') and t.name == 'asyncio_thread']
+                if not existing_threads:
+                    asyncio_thread = threading.Thread(target=self._asyncio_thread, daemon=True, name='asyncio_thread')
+                    asyncio_thread.start()
+                else:
+                    logger.warning("⚠️ Asyncio thread already exists, not creating duplicate")
         else:
             logger.info("⏹️ Stopping bot from GUI...")
             self.running = False
@@ -244,14 +617,37 @@ class AutoScalpingBot:
             
             logger.info("🚀 Bot is running and monitoring the market...")
             
+            # Timer for periodic position refresh
+            # Use config.json intervals if available, otherwise use defaults
+            last_position_refresh = datetime.now().timestamp()
+            last_protection_check = datetime.now()
+            position_refresh_interval = self.config.get('risk', {}).get('protective_refresh_interval', 10.0)  # seconds - from config.json
+            protection_check_interval = 10.0  # seconds - check protection every 10 seconds (less frequent to reduce API calls)
+            
             # Main loop
             while self.running:
                 try:
+                    # Periodic position refresh for live trading
+                    now = datetime.now().timestamp()
+                    if self.mode == 'live_trading' and now - last_position_refresh >= position_refresh_interval:
+                        # IMPORTANT: Refresh positions FIRST, then monitor protection
+                        # This ensures order IDs are preserved during refresh
+                        if hasattr(self.paper_trader, 'refresh_all_positions'):
+                            self.paper_trader.refresh_all_positions()
+                            last_position_refresh = now
+                            logger.debug("🔄 Positions refreshed from Binance API")
+                        
+                        # ✅ Monitor positions for protection system (every 10 seconds to avoid API spam)
+                        # IMPORTANT: Call AFTER refresh to ensure order IDs are checked correctly
+                        if (datetime.now() - last_protection_check).total_seconds() >= protection_check_interval:
+                            self._monitor_position_protection()
+                            last_protection_check = datetime.now()
+                    
                     await self._main_loop()
                     connection_errors = 0
                     backoff_delay = 0.5
                     self.connection_stats['backoff'] = backoff_delay
-                    await asyncio.sleep(0.1)  # V3: minimal delay (100 ms)
+                    await asyncio.sleep(0.5)  # Balanced mode: 500ms delay
                     
                 except ConnectionError as e:
                     connection_errors += 1
@@ -311,12 +707,19 @@ class AutoScalpingBot:
     def _update_gui(self):
         """Refresh all GUI data using Qt signals."""
         try:
-            if not self.running or not self.gui:
+            if not self.gui:
                 return
             
-            # Update account metrics
+            # Note: Position refresh is handled in main loop every 5 seconds
+            # No need to refresh here to avoid duplicate API calls
+            
+            # Update account metrics (always, even when bot is stopped)
             pnl = self.paper_trader.balance - self.paper_trader.starting_balance
             stats = self.paper_trader.get_statistics()
+            
+            # Calculate net profit (PNL - commissions from closed trades)
+            total_commission = sum(trade.total_commission for trade in self.paper_trader.closed_trades)
+            net_profit = pnl - total_commission
             
             self._safe_gui_call(
                 self.gui.update_account_signal,
@@ -326,6 +729,9 @@ class AutoScalpingBot:
                 self.paper_trader.max_drawdown,
                 len(self.paper_trader.positions)
             )
+            
+            # Update net profit widget
+            self._safe_gui_call(self.gui.control_panel.update_net_profit, net_profit)
             
             # Update signals table
             self._safe_gui_call(self.gui.update_signals_signal, self.current_signals)
@@ -358,13 +764,20 @@ class AutoScalpingBot:
         logger.info("⏹️ Stopping bot...")
         self.running = False
         
+        # Check if we should close positions on stop (configurable)
+        close_on_stop = self.config.get('bot_behavior', {}).get('close_positions_on_stop', False)
+        
         if self.paper_trader.positions:
-            logger.info("Closing all open positions...")
-            current_prices = {
-                symbol: self.binance_client.get_current_price(symbol)
-                for symbol in self.paper_trader.positions.keys()
-            }
-            self.paper_trader.close_all_positions(current_prices)
+            if close_on_stop:
+                logger.info("Closing all open positions...")
+                current_prices = {
+                    symbol: self.binance_client.get_current_price(symbol)
+                    for symbol in self.paper_trader.positions.keys()
+                }
+                self.paper_trader.close_all_positions(current_prices)
+            else:
+                logger.info(f"ℹ️ Leaving {len(self.paper_trader.positions)} open positions on exchange")
+                logger.info("💡 Use GUI 'Закрыть' button to close positions manually if needed")
         
         await self.binance_client.stop()
         logger.info("✅ Disconnected from Binance")
@@ -415,14 +828,32 @@ class AutoScalpingBot:
     def run(self):
         """Run the bot with Qt GUI."""
         try:
+            # STRICT check: Another QApplication instance means duplicate
+            # This should never happen if main() check worked, but double-check anyway
+            existing_app = QtWidgets.QApplication.instance()
+            if existing_app:
+                logger.error("❌ Another QApplication instance detected! This should not happen.")
+                logger.error("="*60)
+                logger.error("❌ ERROR: Another bot window is already open!")
+                logger.error("="*60)
+                logger.error("Please close the existing window first before starting a new one.")
+                # Remove lock file since we're not starting
+                lock_file = Path("bot.lock")
+                if lock_file.exists():
+                    try:
+                        lock_file.unlink()
+                    except:
+                        pass
+                sys.exit(1)
+            
             # Create Qt application
-            self.app = QtWidgets.QApplication.instance()
-            if not self.app:
-                self.app = QtWidgets.QApplication(sys.argv)
+            self.app = QtWidgets.QApplication(sys.argv)
             
             # Create main window
             self.gui = TradingPrototype()
             self.gui.show()
+            self.gui.raise_()  # Bring window to front
+            self.gui.activateWindow()  # Activate window
             
             # Connect GUI signals to bot methods
             self.gui.control_panel.connectionToggled.connect(self._on_connection_toggle)
@@ -431,16 +862,33 @@ class AutoScalpingBot:
             
             # Set close callback
             self.app.aboutToQuit.connect(self._on_window_close)
+            # Also handle window close event directly
+            self.gui.closeEvent = lambda event: self._on_window_close() or event.accept()
             
             # Auto-start bot
             logger.info("🚀 Auto-starting bot...")
-            asyncio_thread = threading.Thread(target=self._asyncio_thread, daemon=True)
-            asyncio_thread.start()
-            logger.info("✅ Asyncio thread started")
+            # Check if asyncio thread already exists (prevent duplicates)
+            existing_threads = [t for t in threading.enumerate() if hasattr(t, 'name') and t.name == 'asyncio_thread']
+            if not existing_threads:
+                asyncio_thread = threading.Thread(target=self._asyncio_thread, daemon=True, name='asyncio_thread')
+                asyncio_thread.start()
+                logger.info("✅ Asyncio thread started")
+            else:
+                logger.warning("⚠️ Asyncio thread already exists, not creating duplicate")
+            
+            # Update GUI to show initial data (balance, etc.)
+            self._update_gui()
             
             # Update GUI to show connected state
             self.gui.control_panel.set_connection_toggle_state(True, silent=True)
             self.gui.statusBar().showMessage("Подключение к Binance...", 3000)
+            
+            # Ensure window is visible
+            self.gui.show()
+            self.gui.raise_()
+            self.gui.activateWindow()
+            
+            logger.info("GUI window created and shown")
             
             # Start Qt event loop
             sys.exit(self.app.exec())
@@ -453,53 +901,202 @@ class AutoScalpingBot:
 
 def main():
     """Entry point."""
+    # STRICT duplicate prevention - check BEFORE anything else
+    lock_file = Path("bot.lock")
+    script_name = os.path.basename(__file__)
+    script_path = os.path.abspath(__file__)
+    current_pid = os.getpid()
+    
+    # Step 1: Check for QApplication instance FIRST (before any other checks)
+    try:
+        from PySide6 import QtWidgets
+        existing_app = QtWidgets.QApplication.instance()
+        if existing_app:
+            logger.error("="*60)
+            logger.error("ERROR: Another bot window is already open!")
+            logger.error("="*60)
+            logger.error("Please close the existing window first before starting a new one.")
+            sys.exit(1)
+    except Exception:
+        pass  # Qt not available yet, skip
+    
+    # Step 2: Check for running Python processes with this script
+    # Improved: Only check processes that have been running for at least 3 seconds
+    # This prevents false positives from processes that are just starting up
+    try:
+        import psutil
+        import time
+        found_instances = []
+        current_time = time.time()
+        
+        for proc in psutil.process_iter(['pid', 'name', 'cmdline', 'exe', 'status', 'create_time']):
+            try:
+                proc_pid = proc.info['pid']
+                if proc_pid == current_pid:
+                    continue  # Skip current process
+                
+                # Skip zombie or dead processes
+                proc_status = proc.info.get('status', '').lower()
+                if proc_status in ['zombie', 'dead']:
+                    continue
+                
+                # Check if it's a Python process
+                proc_name = proc.info.get('name', '').lower()
+                if 'python' not in proc_name:
+                    continue
+                
+                # Check command line
+                cmdline = proc.info.get('cmdline', [])
+                if not cmdline:
+                    continue
+                
+                cmdline_str = ' '.join(cmdline).lower()
+                # Check if this script is in command line
+                if script_name.lower() in cmdline_str or script_path.lower() in cmdline_str:
+                    # Double-check: verify process is actually running and stable
+                    try:
+                        proc_obj = psutil.Process(proc_pid)
+                        if not proc_obj.is_running():
+                            continue
+                        
+                        if proc_obj.status() == psutil.STATUS_ZOMBIE:
+                            continue
+                        
+                        # IMPORTANT: Only consider processes that have been running for at least 5 seconds
+                        # This filters out processes that are just starting up (like this one)
+                        # Also check if this process is a child of current process (Qt subprocess)
+                        proc_create_time = proc_obj.create_time()
+                        process_age = current_time - proc_create_time
+                        
+                        if process_age < 5.0:
+                            # Process is too new, likely just starting up - skip it
+                            continue
+                        
+                        # Check if this process is a child of current process (Qt subprocess)
+                        # If so, it's not a duplicate, it's part of the same application
+                        try:
+                            current_proc = psutil.Process(current_pid)
+                            proc_parent = proc_obj.parent()
+                            if proc_parent and proc_parent.pid == current_pid:
+                                # This is a child process of current process - not a duplicate
+                                continue
+                        except:
+                            pass
+                        
+                        # Process is stable and running - this is a real duplicate
+                        found_instances.append((proc_pid, cmdline, process_age))
+                    except (psutil.NoSuchProcess, psutil.AccessDenied):
+                        # Process already dead, skip it
+                        continue
+            except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
+                continue
+            except Exception:
+                continue
+        
+        if found_instances:
+            logger.error("="*60)
+            logger.error("ERROR: Another bot instance is already running!")
+            logger.error("="*60)
+            for pid, cmdline, age in found_instances:
+                logger.error(f"   PID: {pid} (running for {age:.1f} seconds)")
+                logger.error(f"   Command: {' '.join(cmdline[:3])}...")
+            logger.error("="*60)
+            logger.error("Please close the existing instance first before starting a new one.")
+            sys.exit(1)
+    except ImportError:
+        # psutil not available, use lock file only
+        pass
+    except Exception as e:
+        logger.warning(f"Warning: Could not check for duplicate processes: {e}")
+    
+    # Step 3: Check lock file
+    if lock_file.exists():
+        try:
+            with open(lock_file, 'r') as f:
+                old_pid = int(f.read().strip())
+            
+            # Check if process still exists
+            try:
+                import psutil
+                if psutil.pid_exists(old_pid):
+                    logger.error("="*60)
+                    logger.error(f"ERROR: Lock file found! Another bot instance may be running (PID: {old_pid})")
+                    logger.error("="*60)
+                    logger.error("Please close the existing instance first before starting a new one.")
+                    logger.error("If the instance is not running, delete bot.lock file manually.")
+                    sys.exit(1)
+                else:
+                    # Stale lock file, remove it
+                    lock_file.unlink()
+                    logger.info("Removed stale lock file")
+            except ImportError:
+                # psutil not available, try alternative check
+                try:
+                    os.kill(old_pid, 0)  # Check if process exists (doesn't kill it)
+                    logger.error("="*60)
+                    logger.error(f"ERROR: Lock file found! Another bot instance may be running (PID: {old_pid})")
+                    logger.error("="*60)
+                    logger.error("Please close the existing instance first before starting a new one.")
+                    logger.error("If the instance is not running, delete bot.lock file manually.")
+                    sys.exit(1)
+                except (OSError, ProcessLookupError):
+                    # Process doesn't exist, remove stale lock
+                    lock_file.unlink()
+                    logger.info("Removed stale lock file")
+        except (ValueError, FileNotFoundError):
+            # Invalid lock file, remove it
+            lock_file.unlink()
+            logger.info("Removed invalid lock file")
+    
+    # Step 4: Create lock file with current PID
+    try:
+        with open(lock_file, 'w') as f:
+            f.write(str(current_pid))
+    except Exception as e:
+        logger.warning(f"Warning: Could not create lock file: {e}")
+        sys.exit(1)
+    
     Path("logs").mkdir(exist_ok=True)
     Path("results").mkdir(exist_ok=True)
     
     if not Path("config.json").exists():
-        logger.error("❌ config.json not found!")
+        logger.error("config.json not found!")
         return
     
     try:
+        logger.info("Creating bot instance...")
         bot = AutoScalpingBot()
+        logger.info("Bot instance created successfully")
     except Exception as e:
-        logger.error(f"❌ Failed to create bot: {e}", exc_info=True)
-        print(f"❌ Failed to create bot: {e}")
-        traceback.print_exc()
+        logger.error(f"Failed to create bot: {e}", exc_info=True)
         return
     
-    print()
-    print("="*60)
-    print("AUTO SCALPING BOT - CONSOLIDATED RELEASE")
-    print("="*60)
-    print()
-    print("Configuration:")
-    print(f"  Starting balance: ${bot.config['account']['starting_balance']}")
-    print(f"  Leverage: {bot.config['account']['leverage']}x")
-    print(f"  Pairs: {len(bot.config['pairs'])}")
-    print(f"  Minimum confidence: {bot.config['signals']['min_confidence']}%")
-    print()
-    print("Starting bot...")
-    print("To stop: press Ctrl+C or close the GUI window")
-    print()
+    # Log startup info instead of printing (prevents console windows)
+    logger.info("="*60)
+    logger.info("AUTO SCALPING BOT - CONSOLIDATED RELEASE")
+    logger.info("="*60)
+    logger.info("Configuration:")
+    logger.info(f"  Starting balance: ${bot.config['account']['starting_balance']}")
+    logger.info(f"  Leverage: {bot.config['account']['leverage']}x")
+    logger.info(f"  Pairs: {len(bot.pairs)}")
+    logger.info(f"  Minimum confidence: {bot.config['signals']['min_confidence']}%")
+    logger.info("Starting bot...")
+    logger.info("To stop: press Ctrl+C or close the GUI window")
     
     try:
+        logger.info("Starting bot GUI...")
         bot.run()
     except Exception as e:
-        logger.error(f"❌ Bot run failure: {e}", exc_info=True)
-        print(f"❌ Bot run failure: {e}")
-        traceback.print_exc()
+        logger.error(f"Bot run failure: {e}", exc_info=True)
 
 
 if __name__ == "__main__":
     try:
         main()
     except KeyboardInterrupt:
-        print("\n⏹️ Program stopped by user (Ctrl+C)")
+        logger.info("⏹️ Program stopped by user (Ctrl+C)")
         sys.exit(0)
     except Exception as e:
         logger.error(f"❌ Critical error in main(): {e}", exc_info=True)
-        print(f"❌ Critical error: {e}")
-        traceback.print_exc()
         sys.exit(1)
 

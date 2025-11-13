@@ -4,16 +4,16 @@ cd /d "%~dp0"
 
 REM Use specific Python interpreter to avoid duplicate processes
 REM This ensures only one Python process is created
+REM Silent version - no console window
 set PYTHON_PATH=C:\Users\pappahappa\AppData\Local\Programs\Python\Python313\python.exe
 
 REM Check if Python interpreter exists
 if not exist "%PYTHON_PATH%" (
-    echo ERROR: Python interpreter not found at: %PYTHON_PATH%
-    echo Trying default python command...
+    REM Fallback to default python (will show console)
     python main.py
 ) else (
-    echo Starting bot with Python: %PYTHON_PATH%
-    "%PYTHON_PATH%" main.py
+    REM Start bot without console window
+    start "" "%PYTHON_PATH%" main.py
 )
 
-pause
+

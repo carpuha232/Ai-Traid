@@ -95,7 +95,7 @@ class BotCore:
             if pos_price > 0:
                 current_prices_dict[pos_symbol] = pos_price
         
-        self.bot._safe_gui_call(self.bot.gui.update_positions_data, 
+        self.bot._safe_gui_call(self.bot.gui.update_positions, 
                                self.bot.paper_trader.positions, current_prices_dict)
         
         if hasattr(self.bot.gui, 'update_history'):

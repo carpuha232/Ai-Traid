@@ -7,8 +7,6 @@ Operate against Binance Futures (UM) while keeping the interface aligned with Pa
 from __future__ import annotations
 
 import logging
-import threading
-import time
 from datetime import datetime
 from typing import Dict, Optional
 
@@ -66,15 +64,6 @@ class LiveTrader:
         # Initialize Risk Manager
         self.risk_manager = RiskManager(self.client, config)
         logger.info("🛡️ RiskManager initialized")
-        
-        # Protective order lock (prevent race conditions)
-        self._protective_lock = threading.Lock()
-        self.protective_pending = set()  # Symbols currently updating protective orders
-        
-        # Balance cache
-        self.cached_futures_balance = None
-        self.balance_cache_time = 0
-        self.balance_cache_ttl = config.get('risk', {}).get('balance_cache_ttl', 10.0)
         
         # Load existing open positions from Binance
         self._load_existing_positions()
@@ -190,7 +179,6 @@ class LiveTrader:
                     # Initialize advanced risk management fields
                     initial_margin=margin,
                     initial_entry_price=entry_price,
-                    initial_size=quantity,  # CRITICAL: Set initial_size for Martingale!
                     averaging_count=0,
                     total_margin=margin
                 )
@@ -220,17 +208,9 @@ class LiveTrader:
                             averaging_order = order
                     
                     # Stop-loss order: STOP/STOP_MARKET in opposite direction
-                    # TAKE_PROFIT orders are legacy and should be canceled
-                    elif order_type in ['STOP', 'STOP_MARKET']:
+                    elif order_type in ['STOP', 'STOP_MARKET', 'TAKE_PROFIT', 'TAKE_PROFIT_MARKET']:
                         if (side == 'LONG' and order_side == 'SELL') or (side == 'SHORT' and order_side == 'BUY'):
                             stop_order = order
-                    elif order_type in ['TAKE_PROFIT', 'TAKE_PROFIT_MARKET']:
-                        # Cancel legacy TAKE_PROFIT orders - we don't use them anymore
-                        try:
-                            self.client.futures_cancel_order(symbol=symbol, orderId=order['orderId'])
-                            logger.info(f"🗑️ Canceled legacy TAKE_PROFIT order {order['orderId']} for {symbol} (we only use trailing stop now)")
-                        except Exception as e:
-                            logger.debug(f"Failed to cancel TAKE_PROFIT order: {e}")
                 
                 # Assign existing order IDs
                 if stop_order:
@@ -277,26 +257,10 @@ class LiveTrader:
             position_symbols = set(self.positions.keys())
             orphaned_count = 0
             
-            # FIRST: Cancel ALL TAKE_PROFIT orders (legacy - we don't use them anymore)
-            for order in open_orders:
-                order_type = order.get('type')
-                if order_type in ['TAKE_PROFIT', 'TAKE_PROFIT_MARKET']:
-                    symbol = order['symbol']
-                    order_id = str(order['orderId'])
-                    try:
-                        self.client.futures_cancel_order(symbol=symbol, orderId=order_id)
-                        orphaned_count += 1
-                        logger.info(f"🗑️ Canceled legacy TAKE_PROFIT order {order_id} for {symbol} (we only use trailing stop now)")
-                    except Exception as e:
-                        logger.debug(f"Failed to cancel TAKE_PROFIT order {order_id}: {e}")
-            
             for symbol, orders in orders_by_symbol.items():
                 if symbol not in position_symbols:
-                    # Cancel all orders for symbols without positions (except TAKE_PROFIT - already canceled above)
+                    # Cancel all orders for symbols without positions
                     for order in orders:
-                        order_type = order.get('type')
-                        if order_type in ['TAKE_PROFIT', 'TAKE_PROFIT_MARKET']:
-                            continue  # Already canceled above
                         try:
                             self.client.futures_cancel_order(symbol=symbol, orderId=order['orderId'])
                             orphaned_count += 1
@@ -328,112 +292,27 @@ class LiveTrader:
                                 averaging_orders.append(order)
                         
                         # Stop orders (STOP/STOP_MARKET in opposite direction)
-                        # TAKE_PROFIT orders are legacy and should be canceled
-                        elif order_type in ['STOP', 'STOP_MARKET']:
+                        elif order_type in ['STOP', 'STOP_MARKET', 'TAKE_PROFIT', 'TAKE_PROFIT_MARKET']:
                             if (side == 'LONG' and order_side == 'SELL') or (side == 'SHORT' and order_side == 'BUY'):
                                 stop_orders.append(order)
-                        elif order_type in ['TAKE_PROFIT', 'TAKE_PROFIT_MARKET']:
-                            # Cancel legacy TAKE_PROFIT orders - we don't use them anymore
-                            try:
-                                self.client.futures_cancel_order(symbol=symbol, orderId=order_id)
-                                orphaned_count += 1
-                                logger.info(f"🗑️ Canceled legacy TAKE_PROFIT order {order_id} for {symbol} (we only use trailing stop now)")
-                            except Exception as e:
-                                logger.debug(f"Failed to cancel TAKE_PROFIT order {order_id}: {e}")
                     
-                    # Cancel ALL averaging orders if we have an assigned one, or keep only the most recent
-                    assigned_avg_id = str(position.averaging_order_id) if hasattr(position, 'averaging_order_id') and position.averaging_order_id else None
+                    # Cancel duplicate averaging orders
+                    for order in averaging_orders:
+                        try:
+                            self.client.futures_cancel_order(symbol=symbol, orderId=order['orderId'])
+                            orphaned_count += 1
+                            logger.info(f"🗑️ Canceled duplicate averaging order {order['orderId']} for {symbol}")
+                        except Exception as e:
+                            logger.debug(f"Failed to cancel order {order['orderId']}: {e}")
                     
-                    if assigned_avg_id:
-                        # Verify assigned order exists on exchange
-                        assigned_exists = False
-                        for order in averaging_orders:
-                            if str(order['orderId']) == assigned_avg_id:
-                                assigned_exists = True
-                                break
-                        
-                        if assigned_exists:
-                            # We have a valid assigned averaging order - cancel ALL others
-                            for order in averaging_orders:
-                                order_id_str = str(order['orderId'])
-                                if order_id_str != assigned_avg_id:
-                                    try:
-                                        self.client.futures_cancel_order(symbol=symbol, orderId=order_id_str)
-                                        orphaned_count += 1
-                                        logger.info(f"🗑️ Canceled extra averaging order {order_id_str} for {symbol} (have assigned: {assigned_avg_id})")
-                                    except Exception as e:
-                                        logger.debug(f"Failed to cancel order {order_id_str}: {e}")
-                        else:
-                            # Assigned order doesn't exist - clear it and keep only the most recent
-                            position.averaging_order_id = None
-                            if len(averaging_orders) > 1:
-                                averaging_orders.sort(key=lambda x: int(x.get('time', 0)), reverse=True)
-                                for order in averaging_orders[1:]:
-                                    try:
-                                        self.client.futures_cancel_order(symbol=symbol, orderId=order['orderId'])
-                                        orphaned_count += 1
-                                        logger.info(f"🗑️ Canceled duplicate averaging order {order['orderId']} for {symbol} (assigned order missing)")
-                                    except Exception as e:
-                                        logger.debug(f"Failed to cancel order {order['orderId']}: {e}")
-                    elif len(averaging_orders) > 1:
-                        # No assigned order, but multiple exist - keep only the most recent
-                        averaging_orders.sort(key=lambda x: int(x.get('time', 0)), reverse=True)
-                        for order in averaging_orders[1:]:
-                            try:
-                                self.client.futures_cancel_order(symbol=symbol, orderId=order['orderId'])
-                                orphaned_count += 1
-                                logger.info(f"🗑️ Canceled duplicate averaging order {order['orderId']} for {symbol}")
-                            except Exception as e:
-                                logger.debug(f"Failed to cancel order {order['orderId']}: {e}")
-                    
-                    # Cancel ALL stop orders if we have an assigned one, or keep only the most recent
-                    assigned_stop_id = None
-                    if hasattr(position, 'stepped_stop_order_id') and position.stepped_stop_order_id:
-                        assigned_stop_id = str(position.stepped_stop_order_id)
-                    
-                    if assigned_stop_id:
-                        # Verify assigned stop order exists on exchange
-                        assigned_exists = False
-                        for order in stop_orders:
-                            if str(order['orderId']) == assigned_stop_id:
-                                assigned_exists = True
-                                break
-                        
-                        if assigned_exists:
-                            # We have a valid assigned stop order - cancel ALL others
-                            for order in stop_orders:
-                                order_id_str = str(order['orderId'])
-                                if order_id_str != assigned_stop_id:
-                                    try:
-                                        self.client.futures_cancel_order(symbol=symbol, orderId=order_id_str)
-                                        orphaned_count += 1
-                                        logger.info(f"🗑️ Canceled extra stop order {order_id_str} for {symbol} (have assigned stepped: {assigned_stop_id})")
-                                    except Exception as e:
-                                        logger.debug(f"Failed to cancel order {order_id_str}: {e}")
-                        else:
-                            # Assigned stop doesn't exist - clear it and keep only the most recent
-                            position.stepped_stop_order_id = None
-                            position.stepped_stop_active = False
-                            
-                            if len(stop_orders) > 1:
-                                stop_orders.sort(key=lambda x: int(x.get('time', 0)), reverse=True)
-                                for order in stop_orders[1:]:
-                                    try:
-                                        self.client.futures_cancel_order(symbol=symbol, orderId=order['orderId'])
-                                        orphaned_count += 1
-                                        logger.info(f"🗑️ Canceled duplicate stop order {order['orderId']} for {symbol} (assigned stepped order missing)")
-                                    except Exception as e:
-                                        logger.debug(f"Failed to cancel order {order['orderId']}: {e}")
-                    elif len(stop_orders) > 1:
-                        # No assigned order, but multiple exist - keep only the most recent
-                        stop_orders.sort(key=lambda x: int(x.get('time', 0)), reverse=True)
-                        for order in stop_orders[1:]:
-                            try:
-                                self.client.futures_cancel_order(symbol=symbol, orderId=order['orderId'])
-                                orphaned_count += 1
-                                logger.info(f"🗑️ Canceled duplicate stop order {order['orderId']} for {symbol}")
-                            except Exception as e:
-                                logger.debug(f"Failed to cancel order {order['orderId']}: {e}")
+                    # Cancel duplicate stop orders
+                    for order in stop_orders:
+                        try:
+                            self.client.futures_cancel_order(symbol=symbol, orderId=order['orderId'])
+                            orphaned_count += 1
+                            logger.info(f"🗑️ Canceled duplicate stop order {order['orderId']} for {symbol}")
+                        except Exception as e:
+                            logger.debug(f"Failed to cancel order {order['orderId']}: {e}")
             
             if orphaned_count > 0:
                 logger.info(f"🧹 Cleaned up {orphaned_count} orphaned/duplicate orders")
@@ -443,40 +322,6 @@ class LiveTrader:
     # ------------------------------------------------------------------
     # Public interface compatible with PaperTrader
     # ------------------------------------------------------------------
-    def get_futures_balance(self, use_cache: bool = True) -> float:
-        """
-        Get futures account balance with caching.
-        
-        Args:
-            use_cache: Use cached value if available (default True)
-            
-        Returns:
-            Available balance in USDT
-        """
-        now = time.time()
-        
-        # Return cached if valid
-        if use_cache and self.cached_futures_balance is not None:
-            if now - self.balance_cache_time < self.balance_cache_ttl:
-                logger.debug(f"💰 Using cached balance: ${self.cached_futures_balance:.2f}")
-                return self.cached_futures_balance
-        
-        # Fetch fresh balance
-        try:
-            account_info = self.client.futures_account(recvWindow=60000)
-            for asset in account_info.get('assets', []):
-                if asset.get('asset') == 'USDT':
-                    balance = float(asset.get('availableBalance', 0.0))
-                    self.cached_futures_balance = balance
-                    self.balance_cache_time = now
-                    logger.debug(f"💰 Fresh balance fetched: ${balance:.2f}")
-                    return balance
-            return 0.0
-        except Exception as e:
-            logger.error(f"❌ Failed to get futures balance: {e}")
-            # Return cached if available, otherwise 0
-            return self.cached_futures_balance if self.cached_futures_balance is not None else 0.0
-    
     def get_available_balance(self) -> float:
         """
         Get available balance for new positions from Binance API.
@@ -647,27 +492,66 @@ class LiveTrader:
             # Initialize advanced risk management fields
             initial_margin=margin,
             initial_entry_price=avg_price,
-            initial_size=quantity,  # For Martingale strategy
             averaging_count=0,
             total_margin=margin
         )
 
         self.positions[symbol] = position
         
-        # ✅ Place averaging down order immediately after position opens (Martingale)
-        available_balance = self.get_available_balance()
+        # ✅ Place averaging down order immediately after position opens
         averaging_order_id = self.risk_manager.place_averaging_order(
             position=position,
-            liquidation_price=liquidation_price,
-            available_balance=available_balance
+            liquidation_price=liquidation_price
         )
         if averaging_order_id:
             position.averaging_order_id = averaging_order_id
-            logger.info(f"🎯 Martingale averaging order #1 placed for {symbol}: {averaging_order_id}")
+            logger.info(f"🎯 Averaging order placed for {symbol}: {averaging_order_id}")
 
-        # Stop-loss and Take-profit removed - we only use trailing stop now
-        # Trailing stop will be set by _monitor_position_protection when PNL >= +20%
-        # No orders are created at position opening - only trailing stop in profit or martingale in loss
+        # Configure stop/take in reduceOnly mode (LIMIT orders)
+        try:
+            opposite = 'SELL' if direction == 'LONG' else 'BUY'
+            
+            # Calculate limit prices (slightly worse than trigger to ensure execution)
+            slippage = 0.002  # 0.2%
+            stop_price = float(signal.stop_loss)
+            tp_price = float(signal.take_profit_1)
+            
+            if direction == 'LONG':
+                stop_limit_price = stop_price * (1 - slippage)
+                tp_limit_price = tp_price * (1 + slippage)
+            else:  # SHORT
+                stop_limit_price = stop_price * (1 + slippage)
+                tp_limit_price = tp_price * (1 - slippage)
+            
+            # Round prices to tick size
+            stop_limit_price = self.risk_manager._round_to_tick(stop_limit_price, symbol)
+            tp_limit_price = self.risk_manager._round_to_tick(tp_limit_price, symbol)
+
+            # Stop-loss (STOP limit order)
+            self.client.futures_create_order(
+                symbol=symbol,
+                side=opposite,
+                type='STOP',
+                stopPrice=stop_price,
+                price=stop_limit_price,
+                quantity=quantity,
+                reduceOnly='true',
+                timeInForce='GTC'
+            )
+
+            # Take-profit (TAKE_PROFIT limit order)
+            self.client.futures_create_order(
+                symbol=symbol,
+                side=opposite,
+                type='TAKE_PROFIT',
+                stopPrice=tp_price,
+                price=tp_limit_price,
+                quantity=quantity,
+                reduceOnly='true',
+                timeInForce='GTC'
+            )
+        except Exception as exc:
+            logger.warning("⚠️ Failed to create stop/take orders for %s: %s", symbol, exc)
 
         logger.info(
             "%s Opened live position %s %s: price %.4f, qty %.4f, leverage %sx",
@@ -687,65 +571,10 @@ class LiveTrader:
         info = position_info[0]
         position_amt = float(info.get('positionAmt', 0.0))
         unrealized = float(info.get('unRealizedProfit', 0.0))
-        entry_price_from_exchange = float(info.get('entryPrice', 0.0))
 
         position = self.positions[symbol]
         position.current_price = current_price
         position.unrealized_pnl = unrealized
-        
-        # ═══════════════════════════════════════════════════════
-        # MARTINGALE AVERAGING: Check if averaging order executed
-        # ═══════════════════════════════════════════════════════
-        current_size_abs = abs(position_amt)
-        stored_size_abs = abs(position.size)
-        
-        # If position size increased significantly (averaging executed)
-        if current_size_abs > stored_size_abs * 1.5:  # More than 50% increase
-            logger.info(
-                f"🎯 {symbol}: Averaging executed! Size: {stored_size_abs:.6f} → {current_size_abs:.6f}"
-            )
-            
-            # Update position data
-            position.size = position_amt
-            position.averaging_count += 1
-            position.entry_price = entry_price_from_exchange  # Exchange calculates average
-            position.averaging_order_id = None  # Clear executed order
-            
-            # Recalculate liquidation price with new entry
-            new_liquidation = self.risk_manager.calculate_liquidation_price(
-                entry_price=position.entry_price,
-                side=position.side,
-                leverage=position.leverage
-            )
-            position.liquidation_price = new_liquidation
-            
-            logger.info(
-                f"📊 {symbol}: Position updated after averaging #{position.averaging_count} | "
-                f"New Entry: ${position.entry_price:.4f}, New Liq: ${new_liquidation:.4f}"
-            )
-            
-            # Place next Martingale averaging order (if balance available)
-            available_balance = self.get_available_balance()
-            next_order_id = self.risk_manager.place_averaging_order(
-                position=position,
-                liquidation_price=new_liquidation,
-                available_balance=available_balance
-            )
-            
-            if next_order_id:
-                position.averaging_order_id = next_order_id
-                multiplier = 2 ** position.averaging_count
-                logger.info(
-                    f"🎯 {symbol}: Next Martingale averaging #{position.averaging_count + 1} placed "
-                    f"(multiplier={multiplier}x) → Order #{next_order_id}"
-                )
-            else:
-                logger.warning(
-                    f"⚠️ {symbol}: Cannot place next averaging order "
-                    f"(insufficient balance or max count reached)"
-                )
-        
-        # ═══════════════════════════════════════════════════════
 
         if abs(position_amt) < 1e-8:
             # Position closed on exchange (stop/take or manual)
@@ -870,16 +699,6 @@ class LiveTrader:
                 # Update existing position
                 if symbol in self.positions:
                     position = self.positions[symbol]
-                    # IMPORTANT: Preserve order IDs and risk management state before updating
-                    # These are set by _monitor_position_protection and must not be lost
-                    saved_averaging_order_id = getattr(position, 'averaging_order_id', None)
-                    saved_stepped_stop_order_id = getattr(position, 'stepped_stop_order_id', None)
-                    saved_stepped_stop_active = getattr(position, 'stepped_stop_active', False)
-                    saved_is_protected = getattr(position, 'is_protected', False)
-                    saved_initial_size = getattr(position, 'initial_size', None)
-                    saved_averaging_count = getattr(position, 'averaging_count', 0)
-                    
-                    # Update price and PNL
                     position.current_price = mark_price
                     position.unrealized_pnl = unrealized_pnl
                     
@@ -889,22 +708,6 @@ class LiveTrader:
                         if position.side == 'SHORT':
                             price_diff_pct = -price_diff_pct
                         position.unrealized_pnl_percent = price_diff_pct * position.leverage
-                    
-                    # Restore preserved fields (ALWAYS restore, even if None/False)
-                    # This ensures fields are not lost during refresh
-                    position.averaging_order_id = saved_averaging_order_id
-                    position.stepped_stop_order_id = saved_stepped_stop_order_id
-                    position.stepped_stop_active = saved_stepped_stop_active
-                    position.is_protected = saved_is_protected
-                    position.initial_size = saved_initial_size if saved_initial_size else position.size
-                    position.averaging_count = saved_averaging_count
-                    
-                    # Log if order IDs were preserved
-                    if saved_averaging_order_id:
-                        logger.debug(
-                            f"💾 {symbol}: Preserved order IDs - "
-                            f"averaging={saved_averaging_order_id}"
-                        )
                 else:
                     # Load new position that was opened manually
                     side = 'LONG' if position_amt > 0 else 'SHORT'

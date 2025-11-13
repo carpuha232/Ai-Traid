@@ -31,8 +31,6 @@ class TradingPrototype(QtWidgets.QMainWindow):
         self.setObjectName("ScalpingPrototype")
         self.setWindowTitle("Scalping Bot – Qt Prototype")
         self.resize(1366, 700)
-        # Center window on screen
-        self._center_window()
         
         # Connect internal signals
         self.update_account_signal.connect(self.update_account_data)
@@ -86,20 +84,6 @@ class TradingPrototype(QtWidgets.QMainWindow):
         self.control_panel.update_risk_metrics(0, 0, 0)
         
         self.statusBar().showMessage("Ожидание подключения...")
-    
-    def _center_window(self):
-        """Center the window on the primary screen."""
-        try:
-            from PySide6 import QtGui
-            screen = QtGui.QGuiApplication.primaryScreen()
-            if screen:
-                screen_geometry = screen.availableGeometry()
-                window_geometry = self.frameGeometry()
-                center_point = screen_geometry.center()
-                window_geometry.moveCenter(center_point)
-                self.move(window_geometry.topLeft())
-        except Exception:
-            pass  # If centering fails, just use default position
 
     def _build_workspace_section(self) -> QtWidgets.QWidget:
         container = QtWidgets.QWidget()
@@ -596,10 +580,9 @@ class TradingPrototype(QtWidgets.QMainWindow):
             if hasattr(pos, 'unrealized_pnl') and pos.unrealized_pnl is not None:
                 pnl = pos.unrealized_pnl
             else:
-                # Fallback: calculation with leverage
-                # PNL = price_change * size * leverage
+                # Fallback: basic calculation without fees
                 price_diff = (current_price - entry_price) if side == 'LONG' else (entry_price - current_price)
-                pnl = price_diff * size * leverage
+                pnl = price_diff * size
             
             # Get position size in USDT (without leverage) = margin
             # Use margin_usdt if available, otherwise calculate manually
