@@ -71,15 +71,15 @@ class TradingPrototype(QtWidgets.QMainWindow):
         status.showMessage("No connection • Mock mode")
 
         self.control_panel.connectionToggled.connect(self._on_connection_toggle)
-        self.control_panel.autoTradingToggled.connect(self._on_auto_trading_toggle)
+        self.control_panel.singleOrderModeToggled.connect(self._on_single_order_mode_toggle)
         self.control_panel.refreshRequested.connect(self._on_refresh_requested)
 
         self._connection_active = True
-        self._auto_trading_active = False
+        self._single_order_mode_active = False
 
         # Initialize with zero data (will be updated by bot)
         self.control_panel.set_connection_toggle_state(False, silent=True)
-        self.control_panel.set_auto_trading_state(False, silent=True)
+        self.control_panel.set_single_order_mode_state(False, silent=True)
         self.control_panel.update_balance(0)
         self.control_panel.update_pnl(0)
         self.control_panel.update_winrate(0)
@@ -179,9 +179,9 @@ class TradingPrototype(QtWidgets.QMainWindow):
             self.statusBar().showMessage("Соединение закрыто • Моковый режим", 3000)
 
     @QtCore.Slot(bool)
-    def _on_auto_trading_toggle(self, active: bool) -> None:
-        self._auto_trading_active = active
-        message = "Автоторговля запущена • Моковый режим" if active else "Автоторговля остановлена • Моковый режим"
+    def _on_single_order_mode_toggle(self, active: bool) -> None:
+        self._single_order_mode_active = active
+        message = "Режим 1 ордера ВКЛ • Моковый режим" if active else "Обычный режим • Моковый режим"
         self.statusBar().showMessage(message, 3000)
 
     @QtCore.Slot()
@@ -400,13 +400,25 @@ class TradingPrototype(QtWidgets.QMainWindow):
                 color: #0ECB81;
             }
             QPushButton#SecondaryButton {
-                background-color: rgba(240, 185, 11, 0.08);
-                border: 1px solid rgba(240, 185, 11, 0.4);
+                background-color: #14151A;
+                border: 1px solid #F0B90B;
+                border-radius: 6px;
                 color: #F0F4F9;
             }
+            QPushButton#SecondaryButton:hover {
+                background-color: rgba(240, 185, 11, 0.1);
+                border-color: #F0B90B;
+            }
+            QPushButton#SecondaryButton:pressed {
+                background-color: rgba(240, 185, 11, 0.15);
+            }
             QPushButton#SecondaryButton[active="true"] {
-                background-color: rgba(240, 185, 11, 0.25);
-                color: #0B0E11;
+                background-color: rgba(240, 185, 11, 0.2);
+                border-color: #F0B90B;
+                color: #F0F4F9;
+            }
+            QPushButton#SecondaryButton[active="true"]:hover {
+                background-color: rgba(240, 185, 11, 0.3);
             }
             QPushButton#GhostButton {
                 background-color: transparent;

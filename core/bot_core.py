@@ -112,9 +112,7 @@ class BotCore:
     
     async def _analyze_signals(self):
         """Analyse signals for every pair."""
-        # Check if paused (Авто ВЫКЛ)
-        if self.bot.paused:
-            return
+        # Анализ сигналов всегда выполняется (убрана проверка paused)
         
         all_signals = []
         processed = 0
@@ -154,12 +152,14 @@ class BotCore:
                                  strictness_params['min_confidence'])
                 
                 if signal.direction in ['LONG', 'SHORT']:
-                    if signal.confidence < min_conf:
+                    # Use small epsilon to handle float precision issues
+                    if signal.confidence < min_conf - 0.01:
                         logger.info(
                             f"⏸️ {symbol}: {signal.direction} - "
                             f"confidence={signal.confidence:.1f}% < {min_conf:.1f}% "
                             f"(min, strictness={self.bot.strictness_percent:.0f}%)"
                         )
+                        continue  # Skip this signal if confidence is too low
                 
                 if signal.direction in ['LONG', 'SHORT'] and signal.confidence >= min_conf:
                     trades_required = self._calculate_trades_required(signal, strictness_params)
@@ -194,34 +194,109 @@ class BotCore:
                 logger.error(f"Signal analysis failed for {symbol}: {e}")
                 continue
         
-        logger.debug(f"📊 Processed {processed}/{len(self.bot.pairs)} pairs, signals: {len(all_signals)}")
+        logger.info(
+            f"📊 Анализ завершен: обработано {processed}/{len(self.bot.pairs)} пар, "
+            f"найдено сигналов: {len(all_signals)}"
+        )
+        if all_signals:
+            logger.info(
+                f"📋 Найденные сигналы: " + 
+                ", ".join([
+                    f"{s['signal'].symbol} {s['signal'].direction} "
+                    f"({s['signal'].confidence:.1f}%)"
+                    for s in all_signals
+                ])
+            )
         return all_signals
     
     async def _open_best_positions(self, all_signals):
         """Open top-priority positions."""
         all_signals.sort(key=lambda x: x['priority'], reverse=True)
+        strictness_params = self._get_strictness_params()
         
-        max_positions = self.bot.config['account']['max_positions']
+        # Если есть отложенный сигнал для режима 1 ордера - добавляем его в начало очереди
+        pending_signal = getattr(self.bot, 'pending_single_order_signal', None)
+        if pending_signal:
+            try:
+                symbol = pending_signal['signal'].symbol
+                priority = pending_signal['priority']
+            except Exception:
+                symbol = getattr(pending_signal.get('signal'), 'symbol', 'UNKNOWN')
+                priority = pending_signal.get('priority', 0.0)
+            logger.info(
+                f"📥 ECO очередь: пробуем отложенный сигнал {symbol} "
+                f"(priority={priority:.1f})"
+            )
+            all_signals.insert(0, pending_signal)
+            self.bot.pending_single_order_signal = None
         
-        # ✅ Count only UNPROTECTED positions (without +10% stop-loss)
-        # Protected positions don't count towards the limit
-        unprotected_positions = sum(
-            1 for pos in self.bot.paper_trader.positions.values() 
-            if not pos.is_protected
-        )
-        current_positions = unprotected_positions
+        # Проверка режима 1 ордера
+        single_order_mode = getattr(self.bot, 'single_order_mode', False)
         
-        logger.debug(
-            f"📊 Positions: {len(self.bot.paper_trader.positions)} total, "
-            f"{unprotected_positions} unprotected, max={max_positions}"
-        )
+        if single_order_mode:
+            # РЕЖИМ 1 ОРДЕРА: открывается только одна незащищенная позиция
+            # Считаем незащищенные позиции (без стопа в +10%)
+            unprotected_positions = sum(
+                1 for pos in self.bot.paper_trader.positions.values() 
+                if not pos.is_protected
+            )
+            
+            logger.info(
+                f"📊 Режим 1 ордера: {len(all_signals)} сигналов найдено, "
+                f"незащищенных позиций: {unprotected_positions}"
+            )
+            
+            # Если есть незащищенные позиции - не открываем новые
+            if unprotected_positions > 0:
+                logger.info(
+                    f"⏸️ Режим 1 ордера: есть {unprotected_positions} незащищенных позиций. "
+                    f"Новые сделки не открываются, пока позиции не закроются или не будут защищены стопом в +10%"
+                )
+                if all_signals:
+                    best_signal = all_signals[0]
+                    self.bot.pending_single_order_signal = best_signal
+                    logger.info(
+                        f"💾 ECO очередь: сигнал {best_signal['signal'].symbol} "
+                        f"(priority={best_signal['priority']:.1f}) сохранен до установки защиты"
+                    )
+                return  # Не открываем новые позиции
+            
+            # Лимит = 1 (открываем только одну позицию)
+            max_positions = 1
+            current_positions = 0
+        else:
+            # ОБЫЧНЫЙ РЕЖИМ: несколько позиций по лимиту из конфига
+            max_positions = self.bot.config['account']['max_positions']
+            
+            # ✅ Count only UNPROTECTED positions (without +10% stop-loss)
+            # Protected positions don't count towards the limit
+            unprotected_positions = sum(
+                1 for pos in self.bot.paper_trader.positions.values() 
+                if not pos.is_protected
+            )
+            current_positions = unprotected_positions
+            
+            logger.info(
+                f"📊 Обработка сигналов: {len(all_signals)} найдено, "
+                f"позиций: {len(self.bot.paper_trader.positions)} всего, "
+                f"{unprotected_positions} незащищенных, максимум={max_positions}"
+            )
         
         for signal_data in all_signals:
-            if current_positions >= max_positions:
-                logger.debug(f"⏸️ Max unprotected positions ({max_positions}) reached")
-                break
-            
             signal = signal_data['signal']
+            
+            logger.info(
+                f"🔍 {signal.symbol}: Обработка {signal.direction} сигнала "
+                f"(confidence={signal.confidence:.1f}%, priority={signal_data['priority']:.1f})"
+            )
+            
+            if current_positions >= max_positions:
+                mode_desc = "режим 1 ордера" if single_order_mode else f"максимум позиций ({max_positions})"
+                logger.info(
+                    f"⏸️ {signal.symbol}: Достигнут лимит - {mode_desc} "
+                    f"({current_positions}/{max_positions}) - пропускаем"
+                )
+                break
             
             # Fetch current order book
             if signal.confidence >= 90:
@@ -230,41 +305,76 @@ class BotCore:
                 orderbook = self.bot.binance_client.get_orderbook(signal.symbol)
             
             if not orderbook or not orderbook.get('bids') or not orderbook.get('asks'):
-                logger.debug(f"⏸️ {signal.symbol}: no up-to-date order book")
+                logger.info(
+                    f"⏸️ {signal.symbol}: Нет актуального стакана ордеров "
+                    f"(bids={bool(orderbook and orderbook.get('bids'))}, "
+                    f"asks={bool(orderbook and orderbook.get('asks'))})"
+                )
                 continue
             
             # Validate price change tolerance
-            if self.bot.strictness_percent <= 75 and signal.confidence < 90:
+            signals_config = self.bot.config.get('signals', {})
+            price_override_pct = signals_config.get('max_price_change_pct')
+            if price_override_pct is None:
+                allowed_price_diff = strictness_params['max_price_diff']
+            else:
+                allowed_price_diff = price_override_pct / 100.0 if price_override_pct > 0 else None
+            
+            if (
+                allowed_price_diff is not None
+                and self.bot.strictness_percent <= 75
+                and signal.confidence < 90
+            ):
                 current_price = self.bot.binance_client.get_current_price(signal.symbol)
                 if current_price == 0:
+                    logger.info(
+                        f"⏸️ {signal.symbol}: Не удалось получить текущую цену "
+                        f"(current_price=0)"
+                    )
                     continue
                 
-                strictness_params = self._get_strictness_params()
                 price_diff = abs(current_price - signal.entry_price) / signal.entry_price
-                if price_diff > strictness_params['max_price_diff']:
-                    logger.debug(
-                        f"⏸️ {signal.symbol}: price moved {price_diff*100:.2f}% > "
-                        f"{strictness_params['max_price_diff']*100:.2f}%, skipping"
+                if price_diff > allowed_price_diff:
+                    logger.info(
+                        f"⏸️ {signal.symbol}: Цена изменилась на {price_diff*100:.2f}% "
+                        f"> допустимого {allowed_price_diff*100:.2f}% "
+                        f"(signal_price=${signal.entry_price:.4f}, current_price=${current_price:.4f})"
                     )
                     continue
             
             # ✅ Check if position already exists
             if signal.symbol in self.bot.paper_trader.positions:
-                logger.debug(f"⏸️ {signal.symbol}: already have a position, skipping")
+                existing_pos = self.bot.paper_trader.positions[signal.symbol]
+                logger.info(
+                    f"⏸️ {signal.symbol}: Позиция уже существует "
+                    f"({existing_pos.side} @ ${existing_pos.entry_price:.4f}, "
+                    f"ROI={getattr(existing_pos, 'unrealized_pnl_percent', 0):.2f}%)"
+                )
                 continue
             
             # Open the position
             adaptive_params = signal_data.get('adaptive_params', {})
+            logger.info(
+                f"📤 {signal.symbol}: Попытка открыть позицию "
+                f"(entry=${signal.entry_price:.4f}, stop=${signal.stop_loss:.4f}, "
+                f"tp1=${signal.take_profit_1:.4f})"
+            )
+            
             position = self.bot.paper_trader.open_position(signal, orderbook, adaptive_params)
             
             if position:
                 current_positions += 1
                 logger.info(
                     f"{'🟢' if position.side == 'LONG' else '🔴'} "
-                    f"Opened {position.symbol} {position.side}: "
+                    f"✅ {signal.symbol}: Позиция открыта {position.side} @ "
                     f"${position.entry_price:.2f} (leverage: {position.leverage}x, "
                     f"confidence: {signal.confidence:.1f}%, "
                     f"priority: {signal_data['priority']:.1f})"
+                )
+            else:
+                logger.info(
+                    f"❌ {signal.symbol}: Позиция НЕ открыта "
+                    f"(open_position вернул None - см. логи выше для деталей)"
                 )
     
     def _log_statistics(self):

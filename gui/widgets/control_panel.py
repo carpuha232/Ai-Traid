@@ -15,8 +15,9 @@ class ControlPanel(QtWidgets.QFrame):
     strictnessChanged = QtCore.Signal(float)
     riskRatioChanged = QtCore.Signal(float)
     connectionToggled = QtCore.Signal(bool)
-    autoTradingToggled = QtCore.Signal(bool)
+    singleOrderModeToggled = QtCore.Signal(bool)
     refreshRequested = QtCore.Signal()
+    averagingDistanceChanged = QtCore.Signal(float)
 
     def __init__(self, parent: QtWidgets.QWidget | None = None) -> None:
         super().__init__(parent)
@@ -57,7 +58,50 @@ class ControlPanel(QtWidgets.QFrame):
 
         layout.addSpacing(20)
 
-        # === RIGHT: Compact action buttons ===
+        # === RIGHT: Controls and buttons ===
+        right_layout = QtWidgets.QHBoxLayout()
+        right_layout.setSpacing(12)
+
+        # Averaging distance slider container (отдельно, со своим процентом)
+        self._averaging_slider_scale = 100  # 0.01% resolution
+        self._averaging_slider_expand_step = 100  # expand by 1%
+        self._averaging_signal_blocked = False
+        self._pending_averaging_distance = 0.0
+
+        averaging_layout = QtWidgets.QVBoxLayout()
+        averaging_layout.setContentsMargins(0, 0, 0, 0)
+        averaging_layout.setSpacing(2)
+
+        averaging_caption = QtWidgets.QLabel("Усреднение от ликвидации")
+        averaging_caption.setObjectName("ControlCaption")
+        averaging_layout.addWidget(averaging_caption)
+
+        averaging_controls = QtWidgets.QHBoxLayout()
+        averaging_controls.setContentsMargins(0, 0, 0, 0)
+        averaging_controls.setSpacing(6)
+
+        self.averaging_slider = QtWidgets.QSlider(QtCore.Qt.Orientation.Horizontal)
+        self.averaging_slider.setMinimum(0)
+        self.averaging_slider.setMaximum(200)  # initial 2.00%
+        self.averaging_slider.setSingleStep(1)
+        self.averaging_slider.setPageStep(5)
+        self.averaging_slider.setFixedWidth(200)
+        self.averaging_slider.setCursor(QtGui.QCursor(QtCore.Qt.CursorShape.PointingHandCursor))
+        averaging_controls.addWidget(self.averaging_slider)
+
+        self.averaging_value_label = QtWidgets.QLabel("0.00%")
+        self.averaging_value_label.setObjectName("SliderValue")
+        self.averaging_value_label.setMinimumWidth(70)
+        self.averaging_value_label.setAlignment(QtCore.Qt.AlignmentFlag.AlignRight | QtCore.Qt.AlignmentFlag.AlignVCenter)
+        averaging_controls.addWidget(self.averaging_value_label)
+
+        averaging_layout.addLayout(averaging_controls)
+        right_layout.addLayout(averaging_layout)
+
+        # Отступ между ползунком и кнопками
+        right_layout.addSpacing(16)
+
+        # Кнопки: Подключить, Режим 1 ордера, Обновить
         buttons_layout = QtWidgets.QHBoxLayout()
         buttons_layout.setSpacing(8)
 
@@ -69,13 +113,14 @@ class ControlPanel(QtWidgets.QFrame):
         self.connection_button.setFixedWidth(110)
         buttons_layout.addWidget(self.connection_button)
 
-        self.auto_button = QtWidgets.QPushButton("Авто ВЫКЛ")
-        self.auto_button.setObjectName("SecondaryButton")
-        self.auto_button.setCursor(QtGui.QCursor(QtCore.Qt.CursorShape.PointingHandCursor))
-        self.auto_button.setCheckable(True)
-        self.auto_button.setMinimumHeight(36)
-        self.auto_button.setFixedWidth(110)
-        buttons_layout.addWidget(self.auto_button)
+        self.single_order_button = QtWidgets.QPushButton("ECO ВЫКЛ")
+        self.single_order_button.setObjectName("PrimaryButton")  # Такой же стиль как "Подключить"
+        self.single_order_button.setCursor(QtGui.QCursor(QtCore.Qt.CursorShape.PointingHandCursor))
+        self.single_order_button.setCheckable(True)
+        self.single_order_button.setChecked(False)  # По умолчанию ВЫКЛ
+        self.single_order_button.setMinimumHeight(36)
+        self.single_order_button.setFixedWidth(110)  # Такая же ширина как "Подключить"
+        buttons_layout.addWidget(self.single_order_button)
 
         self.refresh_button = QtWidgets.QPushButton("⟳")
         self.refresh_button.setObjectName("GhostButton")
@@ -84,15 +129,23 @@ class ControlPanel(QtWidgets.QFrame):
         self.refresh_button.setFixedWidth(36)
         buttons_layout.addWidget(self.refresh_button)
 
-        layout.addLayout(buttons_layout)
+        right_layout.addLayout(buttons_layout)
+        layout.addLayout(right_layout)
 
         # Wire signals
         self.connection_button.toggled.connect(self._on_connection_toggled)
-        self.auto_button.toggled.connect(self._on_auto_trading_toggled)
+        self.single_order_button.toggled.connect(self._on_single_order_mode_toggled)
         self.refresh_button.clicked.connect(self._on_refresh_clicked)
+        self.averaging_slider.valueChanged.connect(self._on_averaging_slider_value_changed)
+
+        self._averaging_emit_timer = QtCore.QTimer(self)
+        self._averaging_emit_timer.setSingleShot(True)
+        self._averaging_emit_timer.setInterval(400)
+        self._averaging_emit_timer.timeout.connect(self._emit_averaging_distance)
 
         self._update_connection_button_text(False)
-        self._update_auto_button_text(False)
+        self._update_single_order_button_text(False)
+        self.set_averaging_distance(0.0, silent=True)
 
     def _stat_chip(self, title: str, value: str) -> QtWidgets.QFrame:
         chip = QtWidgets.QFrame()
@@ -191,13 +244,21 @@ class ControlPanel(QtWidgets.QFrame):
         if silent:
             self.connection_button.blockSignals(False)
 
-    def set_auto_trading_state(self, active: bool, silent: bool = False) -> None:
+    def set_single_order_mode_state(self, active: bool, silent: bool = False) -> None:
+        """Установить состояние кнопки режима 1 ордера.
+        
+        Args:
+            active: True = ВКЛ (режим 1 ордера), False = ВЫКЛ (обычный режим)
+            silent: Если True, не эмитировать сигналы
+        """
         if silent:
-            self.auto_button.blockSignals(True)
-        self.auto_button.setChecked(active)
-        self._update_auto_button_text(active)
+            self.single_order_button.blockSignals(True)
+        # active=True -> checked=True -> "Режим 1 ордера ВКЛ"
+        # active=False -> checked=False -> "Режим 1 ордера ВЫКЛ"
+        self.single_order_button.setChecked(active)
+        self._update_single_order_button_text(active)
         if silent:
-            self.auto_button.blockSignals(False)
+            self.single_order_button.blockSignals(False)
 
 
 
@@ -205,9 +266,16 @@ class ControlPanel(QtWidgets.QFrame):
         self._update_connection_button_text(checked)
         self.connectionToggled.emit(checked)
 
-    def _on_auto_trading_toggled(self, checked: bool) -> None:
-        self._update_auto_button_text(checked)
-        self.autoTradingToggled.emit(checked)
+    def _on_single_order_mode_toggled(self, checked: bool) -> None:
+        """Обработка переключения кнопки режима 1 ордера.
+        
+        Args:
+            checked: True = ВКЛ (режим 1 ордера), False = ВЫКЛ (обычный режим)
+        """
+        self._update_single_order_button_text(checked)
+        # checked=True означает режим 1 ордера ВКЛ
+        # checked=False означает обычный режим
+        self.singleOrderModeToggled.emit(checked)
 
     def _on_refresh_clicked(self) -> None:
         self.refreshRequested.emit()
@@ -217,10 +285,63 @@ class ControlPanel(QtWidgets.QFrame):
         self.connection_button.setProperty("active", "true" if connected else "false")
         self._refresh_widget(self.connection_button)
 
-    def _update_auto_button_text(self, active: bool) -> None:
-        self.auto_button.setText("Авто ВКЛ" if active else "Авто ВЫКЛ")
-        self.auto_button.setProperty("active", "true" if active else "false")
-        self._refresh_widget(self.auto_button)
+    def _update_single_order_button_text(self, checked: bool) -> None:
+        """Обновление текста кнопки режима 1 ордера.
+        
+        Args:
+            checked: True = ВКЛ (режим 1 ордера), False = ВЫКЛ (обычный режим)
+        """
+        # Используем короткий текст "ECO" чтобы поместился в 110px
+        # checked=True -> "ECO ВКЛ"
+        # checked=False -> "ECO ВЫКЛ"
+        self.single_order_button.setText("ECO ВКЛ" if checked else "ECO ВЫКЛ")
+        self.single_order_button.setProperty("active", "true" if checked else "false")
+        self._refresh_widget(self.single_order_button)
+
+    def _ensure_averaging_slider_range(self, distance: float) -> None:
+        slider_value = int(round(distance * self._averaging_slider_scale))
+        current_max = self.averaging_slider.maximum()
+        if slider_value >= current_max:
+            new_max = slider_value + self._averaging_slider_expand_step
+            self.averaging_slider.setMaximum(new_max)
+
+    def _update_averaging_display(self, distance: float) -> None:
+        self.averaging_value_label.setText(f"{distance:.2f}%")
+
+    @QtCore.Slot(int)
+    def _on_averaging_slider_value_changed(self, raw_value: int) -> None:
+        distance = max(0.0, raw_value / self._averaging_slider_scale)
+        self._ensure_averaging_slider_range(distance)
+        self._pending_averaging_distance = distance
+        self._update_averaging_display(distance)
+        if self._averaging_signal_blocked:
+            return
+        self._averaging_emit_timer.stop()
+        self._averaging_emit_timer.start()
+
+    def _emit_averaging_distance(self) -> None:
+        if self._averaging_signal_blocked:
+            return
+        self.averagingDistanceChanged.emit(self._pending_averaging_distance)
+
+    def set_averaging_distance(self, distance: float, silent: bool = False) -> None:
+        distance = max(0.0, float(distance))
+        self._ensure_averaging_slider_range(distance)
+        slider_value = int(round(distance * self._averaging_slider_scale))
+
+        self._averaging_emit_timer.stop()
+        if silent:
+            self._averaging_signal_blocked = True
+
+        self.averaging_slider.blockSignals(True)
+        self.averaging_slider.setValue(slider_value)
+        self.averaging_slider.blockSignals(False)
+
+        self._pending_averaging_distance = distance
+        self._update_averaging_display(distance)
+
+        if silent:
+            self._averaging_signal_blocked = False
 
     @staticmethod
     def _refresh_widget(widget: QtWidgets.QWidget) -> None:

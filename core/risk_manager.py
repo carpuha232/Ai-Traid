@@ -102,6 +102,58 @@ class RiskManager:
         except Exception as e:
             logger.error(f"❌ Failed to load symbol limits: {e}")
     
+    def _get_symbol_limits(self, symbol: str) -> Optional[SymbolLimits]:
+        """
+        Retrieve limits for symbol from cache or fetch on demand.
+        Needed when managing positions for symbols outside configured pairs.
+        """
+        limits = self.symbol_limits.get(symbol)
+        if limits:
+            return limits
+
+        try:
+            exchange_info = self.client.futures_exchange_info()
+            for symbol_info in exchange_info['symbols']:
+                if symbol_info['symbol'] != symbol:
+                    continue
+
+                min_qty = 0.0
+                max_qty = 0.0
+                step_size = 0.0
+                min_notional = 0.0
+                tick_size = 0.0
+
+                for f in symbol_info['filters']:
+                    if f['filterType'] == 'LOT_SIZE':
+                        min_qty = float(f['minQty'])
+                        max_qty = float(f['maxQty'])
+                        step_size = float(f['stepSize'])
+                    elif f['filterType'] == 'PRICE_FILTER':
+                        tick_size = float(f['tickSize'])
+                    elif f['filterType'] == 'MIN_NOTIONAL':
+                        min_notional = float(f.get('notional') or f.get('minNotional', 0))
+
+                limits = SymbolLimits(
+                    symbol=symbol,
+                    min_qty=min_qty,
+                    max_qty=max_qty,
+                    step_size=step_size,
+                    min_notional=min_notional,
+                    tick_size=tick_size
+                )
+                self.symbol_limits[symbol] = limits
+
+                logger.info(
+                    f"📊 {symbol}: (on-demand) minQty={min_qty}, minNotional={min_notional:.2f}, "
+                    f"stepSize={step_size}, tickSize={tick_size}"
+                )
+
+                return limits
+        except Exception as e:
+            logger.warning(f"⚠️ Failed to fetch limits for {symbol}: {e}")
+
+        return None
+
     def calculate_minimum_margin(
         self, 
         symbol: str, 
@@ -119,7 +171,7 @@ class RiskManager:
         Returns:
             (min_margin, min_quantity)
         """
-        limits = self.symbol_limits.get(symbol)
+        limits = self._get_symbol_limits(symbol)
         if not limits:
             logger.warning(f"⚠️ No limits found for {symbol}, using defaults")
             return 10.0, 0.001
@@ -189,38 +241,76 @@ class RiskManager:
         entry_price: float,
         liquidation_price: float,
         side: str,
-        distance_pct: float = 10.0
+        distance_pct: Optional[float] = None
     ) -> float:
         """
         Calculate price for averaging down order.
-        Order is placed X% away from liquidation price.
+        Order is placed at a fixed percentage distance from liquidation price.
+        IMPORTANT: Order is ALWAYS placed BEFORE liquidation to ensure it executes before liquidation.
         
         Args:
             entry_price: Original entry price
             liquidation_price: Calculated liquidation price
             side: 'LONG' or 'SHORT'
-            distance_pct: Distance from liquidation in % (default 10%)
+            distance_pct: Distance from liquidation in % (overrides config if provided)
             
         Returns:
-            Price for averaging order
+            Price for averaging order (guaranteed to be above liquidation for LONG, below for SHORT)
         """
+        risk_cfg = self.config.get('risk', {})
+        
+        if distance_pct is None:
+            distance_pct = risk_cfg.get('averaging_distance_from_liq_pct', 0.5)
+        
+        # Safety: distance_pct must be positive
+        if distance_pct <= 0:
+            logger.warning(
+                f"⚠️ Averaging distance {distance_pct}% is invalid. "
+                "Using default 0.5% distance from liquidation."
+            )
+            distance_pct = 0.5
+        
+        # Calculate fixed offset from liquidation price
+        offset = liquidation_price * (distance_pct / 100.0)
+        
+        # Minimum safety margin (same as distance for clarity)
+        min_distance_from_liq_pct = distance_pct
+        
         if side == 'LONG':
             # For LONG: liq price is below entry
-            # Order should be between entry and liq, closer to liq
-            price_diff = entry_price - liquidation_price
-            offset = price_diff * (distance_pct / 100.0)
+            # Order MUST be above liquidation to execute before liquidation
             order_price = liquidation_price + offset
+            
+            if order_price <= liquidation_price:
+                # Emergency: place order at least distance_pct above liquidation
+                order_price = liquidation_price * (1 + distance_pct / 100.0)
+                logger.error(
+                    f"🚨 {side}: Averaging order adjusted to ${order_price:.4f} "
+                    f"to stay {distance_pct:.2f}% above liquidation ${liquidation_price:.4f}"
+                )
         else:  # SHORT
             # For SHORT: liq price is above entry
-            # Order should be between entry and liq, closer to liq
-            price_diff = liquidation_price - entry_price
-            offset = price_diff * (distance_pct / 100.0)
+            # Order MUST be below liquidation to execute before liquidation
             order_price = liquidation_price - offset
+            
+            if order_price >= liquidation_price:
+                # Emergency: place order at least distance_pct below liquidation
+                order_price = liquidation_price * (1 - distance_pct / 100.0)
+                logger.error(
+                    f"🚨 {side}: Averaging order adjusted to ${order_price:.4f} "
+                    f"to stay {distance_pct:.2f}% below liquidation ${liquidation_price:.4f}"
+                )
         
-        logger.debug(
-            f"📍 Averaging order for {side}: entry=${entry_price:.2f}, "
-            f"liq=${liquidation_price:.2f}, order=${order_price:.2f} "
-            f"({distance_pct}% from liq)"
+        # Calculate actual distance from liquidation for logging
+        if side == 'LONG':
+            actual_distance_pct = ((order_price - liquidation_price) / liquidation_price) * 100.0
+        else:
+            actual_distance_pct = ((liquidation_price - order_price) / liquidation_price) * 100.0
+        
+        logger.info(
+            f"📍 Averaging order for {side}: entry=${entry_price:.4f}, "
+            f"liq=${liquidation_price:.4f}, order=${order_price:.4f} "
+            f"(fixed distance {distance_pct:.2f}% → actual {actual_distance_pct:.2f}% from liq)"
         )
         
         return order_price
@@ -367,7 +457,7 @@ class RiskManager:
         quantity = (margin * position.leverage) / protective_price
         
         # Round to symbol limits
-        limits = self.symbol_limits.get(position.symbol)
+        limits = self._get_symbol_limits(position.symbol)
         if limits:
             raw_price = protective_price
             raw_qty = quantity
@@ -437,15 +527,13 @@ class RiskManager:
             logger.warning(f"⚠️ {position.symbol}: Max averaging count {max_count} reached")
             return None
         
-        distance_pct = self.config.get('risk', {}).get('averaging_trigger_distance_from_liq', 10.0)
         martingale_enabled = self.config.get('risk', {}).get('averaging_martingale_enabled', False)
         
-        # Calculate order price (distance_pct% from liquidation towards entry)
+        # Calculate order price (fixed distance from liquidation)
         order_price = self.calculate_averaging_order_price(
             entry_price=position.entry_price,
             liquidation_price=liquidation_price,
-            side=position.side,
-            distance_pct=distance_pct
+            side=position.side
         )
         
         # Calculate quantity: размер равен текущей марже в сделке (та же маржа)
@@ -463,20 +551,8 @@ class RiskManager:
             f"qty={quantity:.6f} (равно текущей марже в сделке)"
         )
         
-        # Calculate required margin for this order
-        position_value = order_price * quantity
-        required_margin = position_value / position.leverage
-        
-        # Check if we have enough balance
-        if available_balance is not None and required_margin > available_balance:
-            logger.warning(
-                f"⚠️ {position.symbol}: Insufficient balance for averaging. "
-                f"Required: ${required_margin:.2f}, Available: ${available_balance:.2f}"
-            )
-            return None
-        
         # Round to symbol limits
-        limits = self.symbol_limits.get(position.symbol)
+        limits = self._get_symbol_limits(position.symbol)
         if limits:
             raw_price = order_price
             raw_qty = quantity
@@ -491,16 +567,80 @@ class RiskManager:
                 )
                 quantity = limits.min_qty
             
+            # Check if notional (price * quantity) meets minimum requirement
+            notional = order_price * quantity
+            if limits.min_notional > 0 and notional < limits.min_notional:
+                # Calculate minimum quantity to meet notional requirement
+                min_qty_from_notional = limits.min_notional / order_price
+                # Round up to step_size
+                min_qty_from_notional = ((int(min_qty_from_notional / limits.step_size) + 1) * limits.step_size)
+                # Round to step_size again to ensure precision (fix floating point errors)
+                min_qty_from_notional = self._round_to_step(min_qty_from_notional, limits.step_size)
+                if min_qty_from_notional > quantity:
+                    logger.warning(
+                        f"⚠️ {position.symbol}: Notional ${notional:.2f} < min_notional ${limits.min_notional:.2f}. "
+                        f"Increasing quantity from {quantity:.6f} to {min_qty_from_notional:.6f}"
+                    )
+                    quantity = min_qty_from_notional
+                    # Recalculate notional and margin
+                    notional = order_price * quantity
+                    
+                    # Verify that notional now meets requirement (safety check)
+                    if notional < limits.min_notional:
+                        # If still below, increase by one more step_size
+                        quantity += limits.step_size
+                        quantity = self._round_to_step(quantity, limits.step_size)
+                        notional = order_price * quantity
+                        logger.warning(
+                            f"⚠️ {position.symbol}: Notional still below min after adjustment. "
+                            f"Further increased quantity to {quantity:.6f}, notional=${notional:.2f}"
+                        )
+                    
+                    required_margin = notional / position.leverage
+                    # Check balance again with increased quantity
+                    if available_balance is not None and required_margin > available_balance:
+                        logger.warning(
+                            f"⚠️ {position.symbol}: Insufficient balance for averaging with min_notional. "
+                            f"Required: ${required_margin:.2f}, Available: ${available_balance:.2f}"
+                        )
+                        return None
+            
             logger.debug(
                 f"🔢 {position.symbol}: Rounded qty {raw_qty:.6f}→{quantity:.6f}, "
-                f"price {raw_price:.6f}→{order_price:.6f}"
+                f"price {raw_price:.6f}→{order_price:.6f}, notional=${notional:.2f}"
             )
+        else:
+            # No limits available - calculate notional for logging
+            notional = order_price * quantity
         
         # Final check: quantity must be > 0
         if quantity <= 0:
             logger.error(
                 f"❌ {position.symbol}: Cannot place averaging order - quantity is {quantity:.6f}. "
                 f"Initial size: {initial_size:.6f}, multiplier: {multiplier if martingale_enabled else 1}"
+            )
+            return None
+        
+        # Calculate required margin for this order (after all adjustments)
+        position_value = order_price * quantity
+        required_margin = position_value / position.leverage
+        
+        # Final check: ensure notional meets minimum requirement (for all coins)
+        limits = self._get_symbol_limits(position.symbol)
+        if limits and limits.min_notional > 0:
+            final_notional = order_price * quantity
+            if final_notional < limits.min_notional:
+                logger.error(
+                    f"❌ {position.symbol}: Final notional ${final_notional:.2f} < min_notional ${limits.min_notional:.2f} "
+                    f"after all adjustments. Cannot place order."
+                )
+                return None
+        
+        # Check if we have enough balance
+        if available_balance is not None and required_margin > available_balance:
+            logger.warning(
+                f"⚠️ {position.symbol}: Insufficient balance for averaging. "
+                f"Required: ${required_margin:.2f}, Available: ${available_balance:.2f}"
             )
             return None
         
@@ -584,7 +724,7 @@ class RiskManager:
         )
         
         # Round to symbol limits
-        limits = self.symbol_limits.get(position.symbol)
+        limits = self._get_symbol_limits(position.symbol)
         if limits:
             stop_price = self._round_to_tick(stop_price, limits.tick_size)
         
@@ -678,7 +818,16 @@ class RiskManager:
         # Round down to nearest 10
         trigger_level = (int(current_pnl_pct / 10) * 10)
         stop_level = trigger_level - 10.0
-        return max(10.0, stop_level)  # Minimum stop at +10%
+        
+        # Safety check: stop level must be at least 10% (minimum)
+        if stop_level < 10.0:
+            logger.warning(
+                f"⚠️ Calculated stop level {stop_level:.2f}% < 10% for PNL={current_pnl_pct:.2f}%. "
+                f"Using minimum 10% instead."
+            )
+            stop_level = 10.0
+        
+        return stop_level
     
     def place_emergency_stop_order(
         self,
@@ -738,7 +887,7 @@ class RiskManager:
         )
         
         # Round to symbol limits
-        limits = self.symbol_limits.get(position.symbol)
+        limits = self._get_symbol_limits(position.symbol)
         if limits:
             stop_price = self._round_to_tick(stop_price, limits.tick_size)
         

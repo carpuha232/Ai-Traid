@@ -55,6 +55,8 @@ class Position:
     stepped_stop_active: bool = False  # Активирован ли ступенчатый стоп
     stepped_stop_level_pnl: float = 0.0  # Уровень стопа в % PNL
     stepped_stop_order_id: Optional[str] = None  # ID лимитного stop-loss ордера
+    stepped_stop_replacing: bool = False  # Идёт ли замена стопа на более высокий уровень
+    stepped_stop_last_update: Optional[datetime] = None  # Время последнего обновления стопа
     
     # Protected Position Tracking
     is_protected: bool = False  # Позиция защищена (стоп-лосс в +10% установлен)
@@ -149,18 +151,28 @@ class PaperTrader:
         """Проверка можно ли открыть позицию"""
         # Проверяем максимум позиций
         if len(self.positions) >= self.max_positions:
-            logger.debug(f"Максимум позиций достигнут ({self.max_positions})")
+            logger.info(
+                f"⏸️ {symbol}: Максимум позиций достигнут "
+                f"({len(self.positions)}/{self.max_positions})"
+            )
             return False
         
         # Проверяем есть ли уже позиция по этой паре
         if symbol in self.positions:
-            logger.debug(f"Уже есть позиция по {symbol}")
+            existing_pos = self.positions[symbol]
+            logger.info(
+                f"⏸️ {symbol}: Уже есть позиция "
+                f"({existing_pos.side} @ ${existing_pos.entry_price:.4f})"
+            )
             return False
         
         # Проверяем есть ли свободные средства
         available = self.get_available_balance()
         if available <= 0:
-            logger.debug(f"Нет свободных средств")
+            logger.info(
+                f"⏸️ {symbol}: Нет свободных средств "
+                f"(available=${available:.2f}, balance=${self.balance:.2f})"
+            )
             return False
         
         return True
@@ -206,7 +218,13 @@ class PaperTrader:
         """
         symbol = signal.symbol
         
+        logger.info(
+            f"🔍 {symbol}: Проверка возможности открытия позиции "
+            f"(balance=${self.balance:.2f}, positions={len(self.positions)}/{self.max_positions})"
+        )
+        
         if not self.can_open_position(symbol):
+            logger.info(f"❌ {symbol}: can_open_position вернул False - позиция не может быть открыта")
             return None
         
         # MONTECARLO: Проверяем вероятность прибыли
@@ -222,8 +240,19 @@ class PaperTrader:
             
             # Если вероятность прибыли < 35% - НЕ ВХОДИМ
             if mc_probability < 0.35:
-                logger.debug(f"🎲 Monte Carlo отклонил {symbol}: вероятность {mc_probability*100:.1f}% < 35%")
+                logger.info(
+                    f"⏸️ {symbol}: Monte Carlo отклонил сигнал - "
+                    f"вероятность прибыли {mc_probability*100:.1f}% < 35% "
+                    f"(confidence={signal.confidence:.1f}%, "
+                    f"stop_dist={stop_loss_dist*100:.2f}%, "
+                    f"tp_dist={take_profit_dist*100:.2f}%)"
+                )
                 return None
+            else:
+                logger.info(
+                    f"✅ {symbol}: Monte Carlo одобрил - "
+                    f"вероятность прибыли {mc_probability*100:.1f}% >= 35%"
+                )
         
         # Рассчитываем динамическое плечо на основе уверенности
         base_leverage = self._calculate_dynamic_leverage(signal.confidence)
@@ -261,29 +290,74 @@ class PaperTrader:
             else:  # SHORT
                 entry_price *= (1 - self.slippage_percent / 100)  # Проскальзывание вниз
         
-        # Рассчитываем размер позиции
-        # Риск = % от депозита
-        risk_percent = self.config['risk']['base_risk_percent']
-        risk_amount = self.balance * (risk_percent / 100)
+        # НОВЫЙ РАСЧЕТ МАРЖИ: упрощенный с адаптацией к min_notional
+        # 1. Получаем доступный баланс
+        available_balance = self.get_available_balance()
         
-        # Рассчитываем расстояние до стоп-лосса
-        stop_distance = abs(entry_price - signal.stop_loss) / entry_price
+        # 2. Желаемая маржа = доступный_баланс × 1.1%
+        desired_margin = available_balance * 0.011  # 1.1%
         
-        # Размер позиции основываясь на риске и расстоянии до стопа
-        # Если стоп на 1%, а риск $10, то размер позиции = $1000
-        if stop_distance > 0:
-            position_value = risk_amount / stop_distance
-        else:
-            position_value = risk_amount * position_leverage
+        # 3. Получаем min_notional для символа
+        min_notional = self._get_min_notional(symbol)
         
-        # Ограничиваем размер позиции: не больше 1% от депозита в марже
-        # Это значит позиция не больше 1% × leverage
-        max_margin = self.balance * 0.01  # 1% от баланса
-        max_position_value = max_margin * position_leverage
-        position_value = min(position_value, max_position_value)
+        # 4. Минимальная маржа из notional = min_notional / leverage
+        min_margin_from_notional = min_notional / position_leverage
         
-        # Размер в базовой валюте
+        # 5. Маржа = max(желаемая_маржа, минимальная_маржа_из_notional)
+        margin = max(desired_margin, min_margin_from_notional)
+        
+        # 6. Максимум маржи = доступный_баланс × 1.2%
+        max_margin = available_balance * 0.012  # 1.2%
+        
+        # 7. Ограничиваем максимумом
+        if margin > max_margin:
+            margin = max_margin
+        
+        # 8. Проверка доступного баланса
+        if available_balance < margin:
+            logger.info(
+                f"❌ {symbol}: Недостаточно баланса для открытия позиции. "
+                f"Требуется маржа: ${margin:.2f}, доступно: ${available_balance:.2f}"
+            )
+            return None
+        
+        # 9. Размер позиции = маржа × leverage
+        position_value = margin * position_leverage
+        
+        # 10. Размер в базовой валюте
         size = position_value / entry_price
+        
+        # 11. Проверка минимального notional (дополнительная проверка)
+        notional = entry_price * size
+        if notional < min_notional:
+            logger.warning(
+                f"⚠️ {symbol}: Рассчитанный notional ${notional:.2f} < min_notional ${min_notional:.2f}. "
+                f"Увеличиваем размер позиции до минимума."
+            )
+            # Увеличиваем размер до минимума
+            min_size = min_notional / entry_price
+            size = min_size
+            position_value = min_notional
+            margin = position_value / position_leverage
+            
+            # Проверяем баланс снова
+            if available_balance < margin:
+                logger.info(
+                    f"❌ {symbol}: Недостаточно баланса для минимального notional. "
+                    f"Требуется маржа: ${margin:.2f}, доступно: ${available_balance:.2f}"
+                )
+                return None
+        
+        # Логирование расчета маржи
+        logger.info(
+            f"💰 {symbol}: Расчет маржи - "
+            f"Доступный баланс: ${available_balance:.2f}, "
+            f"Желаемая маржа (1.1%): ${desired_margin:.2f}, "
+            f"Min_notional: ${min_notional:.2f}, "
+            f"Min_маржа из notional: ${min_margin_from_notional:.2f}, "
+            f"Финальная маржа: ${margin:.2f}, "
+            f"Размер позиции: ${position_value:.2f}"
+        )
         
         # actual_position_value для вычислений
         actual_position_value = position_value
@@ -318,7 +392,7 @@ class PaperTrader:
             confidence=signal.confidence,  # Сохраняем confidence для обучения
             liquidation_price=liquidation_price,
             position_value_usdt=actual_position_value,  # Полный размер с плечом
-            margin_usdt=actual_position_value / position_leverage,  # Маржа блокируется
+            margin_usdt=margin,  # Маржа блокируется (рассчитанная выше)
             current_price=entry_price
         )
         
@@ -333,7 +407,7 @@ class PaperTrader:
             liq_dist_pct = abs(liquidation_price - entry_price) / entry_price * 100
         
         logger.info(f"🟢 Открыта {signal.direction} позиция {symbol}: ${entry_price:.2f} x {size:.4f} (плечо: {position_leverage}x, уверенность: {signal.confidence:.1f}%)")
-        logger.info(f"   Размер позиции: ${actual_position_value:.2f}")
+        logger.info(f"   Размер позиции: ${actual_position_value:.2f} | Маржа: ${margin:.2f} ({(margin/available_balance*100):.2f}% от доступного баланса)")
         logger.info(f"   🛡️ Stop: ${signal.stop_loss:.4f} ({stop_dist_pct:.2f}%) | 💀 Liquidation: ${liquidation_price:.4f} ({liq_dist_pct:.2f}%)")
         logger.info(f"   🎯 TP1: ${signal.take_profit_1:.4f} | TP2: ${signal.take_profit_2:.4f}")
         
@@ -569,6 +643,24 @@ class PaperTrader:
             price = current_prices.get(symbol, self.positions[symbol].entry_price)
             self._close_position(self.positions[symbol], price, "Manual Close")
     
+    def _get_min_notional(self, symbol: str) -> float:
+        """Получить минимальный notional для символа.
+        
+        Args:
+            symbol: Торговая пара (например, 'BTCUSDT')
+            
+        Returns:
+            Минимальный notional в USDT (по умолчанию 5.0)
+        """
+        # Можно переопределить через конфиг для конкретных символов
+        symbol_overrides = self.config.get('account', {}).get('min_notional_overrides', {})
+        if symbol in symbol_overrides:
+            return float(symbol_overrides[symbol])
+        
+        # Дефолтное значение для большинства пар на Binance
+        default_min_notional = self.config.get('account', {}).get('default_min_notional', 5.0)
+        return float(default_min_notional)
+    
     def get_available_balance(self) -> float:
         """Получить доступный баланс (не в позициях)
         
@@ -589,6 +681,34 @@ class PaperTrader:
         
         # Баланс не может быть отрицательным (защита от ошибок)
         return max(0.0, available)
+
+    def reduce_position_to_initial_size(self, symbol: str, target_size: float, limits=None) -> bool:
+        """Сбросить позицию до изначального размера (используется в ECO после averaging)."""
+        position = self.positions.get(symbol)
+        if not position:
+            logger.info(f"⏸️ {symbol}: Нет позиции для сброса маржи")
+            return False
+        
+        if position.size <= target_size:
+            logger.debug(
+                f"ℹ️ {symbol}: Размер позиции уже равен стартовому "
+                f"(current={position.size:.6f}, target={target_size:.6f})"
+            )
+            return False
+        
+        reduce_qty = position.size - target_size
+        position.size = target_size
+        position.margin_usdt = position.initial_margin
+        position.position_value_usdt = position.initial_margin * position.leverage
+        position.total_margin = position.initial_margin
+        position.averaging_count = 0
+        position.averaging_order_id = None
+        
+        logger.info(
+            f"🔁 {symbol}: Сброс маржи до стартового уровня, уменьшено {reduce_qty:.6f} "
+            f"(новый размер={position.size:.6f})"
+        )
+        return True
     
     def get_statistics(self) -> Dict:
         """Получить статистику торговли"""
