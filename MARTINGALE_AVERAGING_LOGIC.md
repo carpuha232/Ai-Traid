@@ -365,3 +365,4 @@ total_invested = initial_margin × (2^(N+1) - 1)
 
 
 
+

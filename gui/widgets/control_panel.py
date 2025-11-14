@@ -18,6 +18,8 @@ class ControlPanel(QtWidgets.QFrame):
     singleOrderModeToggled = QtCore.Signal(bool)
     refreshRequested = QtCore.Signal()
     averagingDistanceChanged = QtCore.Signal(float)
+    demoModeToggled = QtCore.Signal(bool)
+    demoResetRequested = QtCore.Signal()
 
     def __init__(self, parent: QtWidgets.QWidget | None = None) -> None:
         super().__init__(parent)
@@ -122,6 +124,22 @@ class ControlPanel(QtWidgets.QFrame):
         self.single_order_button.setFixedWidth(110)  # Такая же ширина как "Подключить"
         buttons_layout.addWidget(self.single_order_button)
 
+        self.demo_button = QtWidgets.QPushButton("DEMO ВЫКЛ")
+        self.demo_button.setObjectName("PrimaryButton")
+        self.demo_button.setCursor(QtGui.QCursor(QtCore.Qt.CursorShape.PointingHandCursor))
+        self.demo_button.setCheckable(True)
+        self.demo_button.setChecked(False)
+        self.demo_button.setMinimumHeight(36)
+        self.demo_button.setFixedWidth(110)
+        buttons_layout.addWidget(self.demo_button)
+
+        self.demo_reset_button = QtWidgets.QPushButton("")
+        self.demo_reset_button.setObjectName("DangerCircleButton")
+        self.demo_reset_button.setCursor(QtGui.QCursor(QtCore.Qt.CursorShape.PointingHandCursor))
+        self.demo_reset_button.setToolTip("Сбросить демо баланс и историю")
+        self.demo_reset_button.setFixedSize(28, 28)
+        buttons_layout.addWidget(self.demo_reset_button)
+
         self.refresh_button = QtWidgets.QPushButton("⟳")
         self.refresh_button.setObjectName("GhostButton")
         self.refresh_button.setCursor(QtGui.QCursor(QtCore.Qt.CursorShape.PointingHandCursor))
@@ -135,8 +153,10 @@ class ControlPanel(QtWidgets.QFrame):
         # Wire signals
         self.connection_button.toggled.connect(self._on_connection_toggled)
         self.single_order_button.toggled.connect(self._on_single_order_mode_toggled)
+        self.demo_button.toggled.connect(self._on_demo_mode_toggled)
         self.refresh_button.clicked.connect(self._on_refresh_clicked)
         self.averaging_slider.valueChanged.connect(self._on_averaging_slider_value_changed)
+        self.demo_reset_button.clicked.connect(self._on_demo_reset_clicked)
 
         self._averaging_emit_timer = QtCore.QTimer(self)
         self._averaging_emit_timer.setSingleShot(True)
@@ -145,6 +165,7 @@ class ControlPanel(QtWidgets.QFrame):
 
         self._update_connection_button_text(False)
         self._update_single_order_button_text(False)
+        self._update_demo_button_text(False)
         self.set_averaging_distance(0.0, silent=True)
 
     def _stat_chip(self, title: str, value: str) -> QtWidgets.QFrame:
@@ -260,6 +281,14 @@ class ControlPanel(QtWidgets.QFrame):
         if silent:
             self.single_order_button.blockSignals(False)
 
+    def set_demo_mode_state(self, active: bool, silent: bool = False) -> None:
+        if silent:
+            self.demo_button.blockSignals(True)
+        self.demo_button.setChecked(active)
+        self._update_demo_button_text(active)
+        if silent:
+            self.demo_button.blockSignals(False)
+
 
 
     def _on_connection_toggled(self, checked: bool) -> None:
@@ -277,8 +306,15 @@ class ControlPanel(QtWidgets.QFrame):
         # checked=False означает обычный режим
         self.singleOrderModeToggled.emit(checked)
 
+    def _on_demo_mode_toggled(self, checked: bool) -> None:
+        self._update_demo_button_text(checked)
+        self.demoModeToggled.emit(checked)
+
     def _on_refresh_clicked(self) -> None:
         self.refreshRequested.emit()
+
+    def _on_demo_reset_clicked(self) -> None:
+        self.demoResetRequested.emit()
 
     def _update_connection_button_text(self, connected: bool) -> None:
         self.connection_button.setText("Отключить" if connected else "Подключить")
@@ -297,6 +333,11 @@ class ControlPanel(QtWidgets.QFrame):
         self.single_order_button.setText("ECO ВКЛ" if checked else "ECO ВЫКЛ")
         self.single_order_button.setProperty("active", "true" if checked else "false")
         self._refresh_widget(self.single_order_button)
+
+    def _update_demo_button_text(self, checked: bool) -> None:
+        self.demo_button.setText("DEMO ВКЛ" if checked else "DEMO ВЫКЛ")
+        self.demo_button.setProperty("active", "true" if checked else "false")
+        self._refresh_widget(self.demo_button)
 
     def _ensure_averaging_slider_range(self, distance: float) -> None:
         slider_value = int(round(distance * self._averaging_slider_scale))

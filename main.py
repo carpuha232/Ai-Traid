@@ -12,6 +12,7 @@ import threading
 import os
 from pathlib import Path
 from datetime import datetime
+from typing import Optional
 
 # Internal modules
 from core.binance_client import BinanceRealtimeClient
@@ -105,15 +106,20 @@ class AutoScalpingBot:
             logger.info("🤖 AUTO SCALPING BOT - CONSOLIDATED RELEASE")
             logger.info("="*60)
             
-            # Check API keys only for live trading mode
-            self.mode = self.config.get('mode', 'paper_trading')
-            if self.mode == 'live_trading' and self.config['api']['key'] == "INSERT_YOUR_API_KEY_HERE":
-                logger.error("❌ API keys are not configured! Update config.json.")
-                raise ValueError("API keys are not configured")
-            elif self.mode == 'paper_trading':
-                logger.info("📊 Running in PAPER TRADING mode (demo)")
-            elif self.mode == 'live_trading':
-                logger.info("🚀 Running in LIVE TRADING mode")
+            # Determine requested startup mode (live by default)
+            requested_mode = self.config.get('mode', 'live_trading')
+            self.mode = 'live_trading'  # actual active mode (can switch to demo at runtime)
+            self._pending_demo_autostart = (requested_mode == 'paper_trading')
+
+            if self.config['api']['key'] == "INSERT_YOUR_API_KEY_HERE":
+                logger.warning("⚠️ API keys are placeholders. Configure real keys for live trading.")
+                if not self._pending_demo_autostart:
+                    logger.error("❌ Live trading requires valid API keys.")
+                    raise ValueError("API keys are not configured")
+            if self._pending_demo_autostart:
+                logger.info("📊 Config requests PAPER (Demo) mode — will enable Demo after GUI startup.")
+            else:
+                logger.info("🚀 Running in LIVE TRADING mode (Demo can be toggled in GUI).")
             
             # Log Testnet status
             if self.config.get('api', {}).get('testnet', False):
@@ -132,19 +138,20 @@ class AutoScalpingBot:
         self.signal_analyzer = SignalAnalyzer(self.config)
         self.signal_analyzer.set_trading_mode("Moderate")
 
-        if self.mode == 'live_trading':
-            self.paper_trader = LiveTrader(
-                self.config,
-                self.config['api']['key'],
-                self.config['api']['secret']
-            )
-            logger.info("🚀 Trading mode: LIVE")
-        else:
-            self.paper_trader = PaperTrader(
-                self.config,
-                self.config['account']['starting_balance']
-            )
-            logger.info("🎯 Trading mode: PAPER")
+        self.live_trader = LiveTrader(
+            self.config,
+            self.config['api']['key'],
+            self.config['api']['secret']
+        )
+        self.paper_trader = self.live_trader
+        self.demo_trader: Optional[PaperTrader] = None
+        self.demo_mode_active = False
+        self.demo_start_balance = (
+            self.config.get('demo', {}).get('starting_balance')
+            or self.config.get('account', {}).get('demo_starting_balance')
+            or 10_000.0
+        )
+        logger.info(f"💼 Live trader initialised. Demo starting balance = ${self.demo_start_balance:,.2f}")
         
         # Qt GUI
         self.app = None
@@ -795,6 +802,73 @@ class AutoScalpingBot:
                     f"Новые сделки не будут открываться, пока все позиции не закроются или не будут защищены."
                 )
     
+    def _show_gui_dialog(self, title: str, text: str, level: str = "info") -> None:
+        """Thread-safe helper to show a GUI dialog."""
+        if not self.gui:
+            logger.info(f"{title}: {text}")
+            return
+        self._safe_gui_call(self.gui.dialogRequested, title, text, level)
+
+    def _get_or_create_demo_trader(self, reset: bool = False) -> PaperTrader:
+        """Create (or reset) persistent demo trader."""
+        if reset or self.demo_trader is None:
+            self.demo_trader = PaperTrader(self.config, starting_balance=self.demo_start_balance)
+            logger.info(f"🎮 Demo trader initialised with balance ${self.demo_start_balance:,.2f}")
+        return self.demo_trader
+
+    def _activate_demo_mode(self, initial: bool = False) -> None:
+        """Switch runtime to demo trader."""
+        self.demo_mode_active = True
+        self.mode = 'demo_trading'
+        self.paper_trader = self._get_or_create_demo_trader()
+        if self.gui:
+            self._safe_gui_call(self.gui.set_demo_mode_signal, True, True)
+        logger.info("🎮 Demo mode enabled (virtual orders, real quotes).")
+        if not initial:
+            self._show_gui_dialog("Демо режим", "Используем виртуальный баланс $10,000.", "info")
+        self._update_gui()
+
+    def _deactivate_demo_mode(self) -> None:
+        """Return to live trader."""
+        self.demo_mode_active = False
+        self.mode = 'live_trading'
+        self.paper_trader = self.live_trader
+        if self.gui:
+            self._safe_gui_call(self.gui.set_demo_mode_signal, False, True)
+        logger.info("💼 Live mode enabled.")
+        self._show_gui_dialog("Live режим", "Возвращаемся к реальным ордерам.", "info")
+        self._update_gui()
+
+    def _on_demo_mode_toggle(self, active: bool) -> None:
+        """Handle GUI demo toggle."""
+        if active:
+            if self.demo_mode_active:
+                return
+            if getattr(self.live_trader, 'positions', {}):
+                self._show_gui_dialog(
+                    "Нельзя включить демо",
+                    "Сначала закройте все LIVE позиции, чтобы избежать несогласованных ордеров.",
+                    "warning"
+                )
+                if self.gui:
+                    self._safe_gui_call(self.gui.set_demo_mode_signal, False, True)
+                return
+            self._activate_demo_mode()
+        else:
+            if not self.demo_mode_active:
+                return
+            self._deactivate_demo_mode()
+
+    def _on_demo_reset_requested(self) -> None:
+        """Handle click on red demo reset button."""
+        if not self.demo_mode_active:
+            self._show_gui_dialog("Сброс демо", "Сначала включите демо режим, чтобы сбросить историю.", "warning")
+            return
+        self._get_or_create_demo_trader(reset=True)
+        self.paper_trader = self.demo_trader
+        self._update_gui()
+        self._show_gui_dialog("Демо сброшено", "История очищена, баланс снова $10,000.", "info")
+
     def _on_refresh_requested(self):
         """Handle refresh button click."""
         logger.info("🔄 Manual refresh requested")
@@ -1193,8 +1267,18 @@ class AutoScalpingBot:
             # Connect GUI signals to bot methods
             self.gui.control_panel.connectionToggled.connect(self._on_connection_toggle)
             self.gui.control_panel.singleOrderModeToggled.connect(self._on_single_order_mode_toggle)
+            self.gui.control_panel.demoModeToggled.connect(self._on_demo_mode_toggle)
+            self.gui.control_panel.demoResetRequested.connect(self._on_demo_reset_requested)
             self.gui.control_panel.refreshRequested.connect(self._on_refresh_requested)
             self.gui.control_panel.averagingDistanceChanged.connect(self._on_averaging_distance_changed)
+
+            # Sync demo button with actual state
+            if self.demo_mode_active:
+                self.gui.set_demo_mode_signal.emit(True, True)
+            elif self._pending_demo_autostart:
+                logger.info("🎮 Enabling Demo mode per config request…")
+                self._pending_demo_autostart = False
+                self._activate_demo_mode(initial=True)
             
             # Set close callback
             self.app.aboutToQuit.connect(self._on_window_close)

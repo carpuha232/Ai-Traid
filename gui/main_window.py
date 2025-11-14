@@ -24,6 +24,8 @@ class TradingPrototype(QtWidgets.QMainWindow):
     update_signals_signal = QtCore.Signal(dict)
     update_positions_signal = QtCore.Signal(dict, dict)
     update_history_signal = QtCore.Signal(list)
+    set_demo_mode_signal = QtCore.Signal(bool, bool)
+    dialogRequested = QtCore.Signal(str, str, str)
     
     def __init__(self):
         super().__init__()
@@ -72,6 +74,7 @@ class TradingPrototype(QtWidgets.QMainWindow):
 
         self.control_panel.connectionToggled.connect(self._on_connection_toggle)
         self.control_panel.singleOrderModeToggled.connect(self._on_single_order_mode_toggle)
+        self.control_panel.demoModeToggled.connect(self._on_demo_mode_toggle)
         self.control_panel.refreshRequested.connect(self._on_refresh_requested)
 
         self._connection_active = True
@@ -80,12 +83,17 @@ class TradingPrototype(QtWidgets.QMainWindow):
         # Initialize with zero data (will be updated by bot)
         self.control_panel.set_connection_toggle_state(False, silent=True)
         self.control_panel.set_single_order_mode_state(False, silent=True)
+        self.control_panel.set_demo_mode_state(False, silent=True)
         self.control_panel.update_balance(0)
         self.control_panel.update_pnl(0)
         self.control_panel.update_winrate(0)
         self.control_panel.update_risk_metrics(0, 0, 0)
         
         self.statusBar().showMessage("Ожидание подключения...")
+        self._demo_mode_active = False
+
+        self.set_demo_mode_signal.connect(self._set_demo_mode_from_bot)
+        self.dialogRequested.connect(self._show_dialog)
     
     def _center_window(self):
         """Center the window on the primary screen."""
@@ -183,6 +191,10 @@ class TradingPrototype(QtWidgets.QMainWindow):
         self._single_order_mode_active = active
         message = "Режим 1 ордера ВКЛ • Моковый режим" if active else "Обычный режим • Моковый режим"
         self.statusBar().showMessage(message, 3000)
+
+    @QtCore.Slot(bool)
+    def _on_demo_mode_toggle(self, active: bool) -> None:
+        self._update_demo_status(active)
 
     @QtCore.Slot()
     def _on_refresh_requested(self) -> None:
@@ -420,6 +432,15 @@ class TradingPrototype(QtWidgets.QMainWindow):
             QPushButton#SecondaryButton[active="true"]:hover {
                 background-color: rgba(240, 185, 11, 0.3);
             }
+            QPushButton#DangerCircleButton {
+                background-color: rgba(246, 70, 93, 0.85);
+                border: none;
+                border-radius: 14px;
+                color: transparent;
+            }
+            QPushButton#DangerCircleButton:hover {
+                background-color: rgba(246, 70, 93, 1.0);
+            }
             QPushButton#GhostButton {
                 background-color: transparent;
                 border: 1px solid rgba(234, 236, 239, 0.08);
@@ -541,6 +562,28 @@ class TradingPrototype(QtWidgets.QMainWindow):
                 font-weight: 500;
             }
         """)
+
+    @QtCore.Slot(bool, bool)
+    def _set_demo_mode_from_bot(self, active: bool, silent: bool) -> None:
+        self.control_panel.set_demo_mode_state(active, silent)
+        self._update_demo_status(active)
+
+    def _update_demo_status(self, active: bool) -> None:
+        self._demo_mode_active = active
+        if active:
+            self.statusBar().showMessage("Демо режим активен • Виртуальный баланс", 3000)
+        else:
+            self.statusBar().showMessage("Live режим активен", 3000)
+
+    @QtCore.Slot(str, str, str)
+    def _show_dialog(self, title: str, text: str, level: str = "info") -> None:
+        icon = QtWidgets.QMessageBox.Icon.Information
+        if level == "warning":
+            icon = QtWidgets.QMessageBox.Icon.Warning
+        elif level == "error":
+            icon = QtWidgets.QMessageBox.Icon.Critical
+        msg_box = QtWidgets.QMessageBox(icon, title, text, parent=self)
+        msg_box.exec()
     
     # ========== DATA UPDATE METHODS ==========
     
