@@ -10,7 +10,7 @@ import random
 from datetime import datetime, timedelta
 
 from PySide6 import QtCore, QtGui, QtWidgets
-
+from typing import List, Optional
 
 
 # Import widgets from modular components
@@ -32,13 +32,15 @@ class TradingPrototype(QtWidgets.QMainWindow):
     update_positions_signal = QtCore.Signal(dict, dict)
     update_history_signal = QtCore.Signal(list)
     update_orders_signal = QtCore.Signal(list)
+    start_position_requested = QtCore.Signal(str)
     
-    def __init__(self):
+    def __init__(self, pairs: Optional[List[str]] = None):
         super().__init__()
 
         self.setObjectName("ScalpingPrototype")
         self.setWindowTitle("Scalping Bot – Qt Prototype")
         self.resize(1366, 700)
+        self.available_pairs = pairs or []
         
         # Connect internal signals
         self.update_account_signal.connect(self.update_account_data)
@@ -109,7 +111,7 @@ class TradingPrototype(QtWidgets.QMainWindow):
         signals_frame.setMinimumHeight(200)
         left_splitter.addWidget(signals_frame)
 
-        positions_frame = self._section_frame("Open Positions", self.positions_widget)
+        positions_frame = self._build_positions_section()
         positions_frame.setMinimumHeight(180)
         positions_frame.setSizePolicy(QtWidgets.QSizePolicy.Policy.Expanding, QtWidgets.QSizePolicy.Policy.Expanding)
         left_splitter.addWidget(positions_frame)
@@ -159,6 +161,43 @@ class TradingPrototype(QtWidgets.QMainWindow):
         v.addWidget(content)
         return frame
 
+    def _build_positions_section(self) -> QtWidgets.QFrame:
+        frame = QtWidgets.QFrame()
+        frame.setObjectName("SectionFrame")
+        v = QtWidgets.QVBoxLayout(frame)
+        v.setContentsMargins(8, 6, 8, 8)
+        v.setSpacing(4)
+
+        header_row = QtWidgets.QHBoxLayout()
+        header_row.setContentsMargins(0, 0, 0, 0)
+
+        header = QtWidgets.QLabel("OPEN POSITIONS")
+        header.setObjectName("SectionTitle")
+        header_row.addWidget(header)
+        header_row.addStretch(1)
+
+        self.start_symbol_combo = QtWidgets.QComboBox()
+        self.start_symbol_combo.setObjectName("StartSymbolCombo")
+        self.start_symbol_combo.setCursor(QtGui.QCursor(QtCore.Qt.CursorShape.PointingHandCursor))
+        self.start_symbol_combo.setFocusPolicy(QtCore.Qt.FocusPolicy.NoFocus)
+        if self.available_pairs:
+            self.start_symbol_combo.addItems(self.available_pairs)
+        else:
+            self.start_symbol_combo.addItem("XRPUSDT")
+        header_row.addWidget(self.start_symbol_combo)
+
+        self.start_button = QtWidgets.QPushButton("Старт")
+        self.start_button.setObjectName("StartPositionButton")
+        self.start_button.setCursor(QtGui.QCursor(QtCore.Qt.CursorShape.PointingHandCursor))
+        self.start_button.setFocusPolicy(QtCore.Qt.FocusPolicy.NoFocus)
+        self.start_button.setMinimumWidth(90)
+        self.start_button.clicked.connect(self._on_start_button_clicked)
+        header_row.addWidget(self.start_button)
+
+        v.addLayout(header_row)
+        v.addWidget(self.positions_widget)
+        return frame
+
     def _update_signal_stats(self) -> None:
         # Update positions count
         positions_count = self.positions_widget.rowCount()
@@ -173,6 +212,14 @@ class TradingPrototype(QtWidgets.QMainWindow):
             self.statusBar().showMessage("Подключение установлено • Моковый режим", 3000)
         else:
             self.statusBar().showMessage("Соединение закрыто • Моковый режим", 3000)
+
+    @QtCore.Slot()
+    def _on_start_button_clicked(self):
+        """Emit event to открыть минимальную позицию."""
+        symbol = ""
+        if hasattr(self, "start_symbol_combo") and self.start_symbol_combo.count() > 0:
+            symbol = self.start_symbol_combo.currentText()
+        self.start_position_requested.emit(symbol)
 
 
     def _apply_styles(self):
@@ -385,6 +432,21 @@ class TradingPrototype(QtWidgets.QMainWindow):
                 border-color: rgba(14, 203, 129, 0.62);
                 color: #0ECB81;
             }
+            QPushButton#StartPositionButton {
+                background-color: rgba(14, 203, 129, 0.18);
+                border: 1px solid rgba(14, 203, 129, 0.45);
+                color: #0ECB81;
+                font-size: 11px;
+                padding: 6px 12px;
+            }
+            QPushButton#StartPositionButton:hover {
+                background-color: rgba(14, 203, 129, 0.32);
+            }
+            QPushButton#StartPositionButton:disabled {
+                background-color: rgba(126, 135, 148, 0.2);
+                border-color: rgba(126, 135, 148, 0.35);
+                color: #7E8794;
+            }
             QPushButton#SecondaryButton {
                 background-color: rgba(240, 185, 11, 0.08);
                 border: 1px solid rgba(240, 185, 11, 0.4);
@@ -584,66 +646,53 @@ class TradingPrototype(QtWidgets.QMainWindow):
             self.positions_widget.setRowCount(0)
             return
         
-        # Set row count to match positions
         self.positions_widget.setRowCount(len(positions))
         
-        # Update each position row
         for row, (symbol, pos) in enumerate(positions.items()):
-            current_price = current_prices.get(symbol, 0)
-            
-            # pos is a Position object, not dict
-            side = pos.side if hasattr(pos, 'side') else 'LONG'
-            entry_price = pos.entry_price if hasattr(pos, 'entry_price') else 0
-            size = pos.size if hasattr(pos, 'size') else 0
-            stop_loss = pos.stop_loss if hasattr(pos, 'stop_loss') else entry_price
-            take_profit = pos.take_profit_1 if hasattr(pos, 'take_profit_1') else entry_price
-            leverage = pos.leverage if hasattr(pos, 'leverage') else 1
-            
-            # Calculate PNL
-            if side == 'LONG':
-                pnl = (current_price - entry_price) * size
-            else:
-                pnl = (entry_price - current_price) * size
-            
-            # Get position size in USDT (without leverage) = margin
-            # Use margin_usdt if available, otherwise calculate manually
-            if hasattr(pos, 'margin_usdt') and pos.margin_usdt > 0:
-                position_value_usdt = pos.margin_usdt
-            else:
-                # Fallback: calculate from position value / leverage
-                position_value_usdt = (entry_price * size) / leverage
-            
-            # Column 0: Symbol (без суффикса |SIDE), цвет по направлению
             display_symbol = symbol.split('|')[0] if '|' in symbol else symbol
-            symbol_item = QtWidgets.QTableWidgetItem(display_symbol)
-            symbol_item.setForeground(
-                QtGui.QColor("#0ECB81") if side == 'LONG' else QtGui.QColor("#F6465D")
-            )
+            side = getattr(pos, 'side', 'LONG')
+            leverage = int(getattr(pos, 'leverage', 1) or 1)
+            entry_price = float(getattr(pos, 'entry_price', 0.0))
+            size_qty = float(getattr(pos, 'size', 0.0))
+            live_price = float(current_prices.get(symbol, getattr(pos, 'mark_price', entry_price)))
+            mark_price = live_price
+            break_even = float(getattr(pos, 'break_even_price', entry_price))
+            liquidation = float(getattr(pos, 'liquidation_price', 0.0))
+            margin_ratio = float(getattr(pos, 'margin_ratio', 0.0))
+            if margin_ratio < 1:
+                margin_ratio *= 100.0
+            margin_used = float(getattr(pos, 'margin_usdt', 0.0))
+            if margin_used <= 0 and leverage:
+                margin_used = (entry_price * size_qty) / leverage if leverage else 0.0
+            notional = float(getattr(pos, 'position_value_usdt', entry_price * size_qty))
+            if side == 'LONG':
+                unrealized = (live_price - entry_price) * size_qty
+            else:
+                unrealized = (entry_price - live_price) * size_qty
+            roi = (unrealized / margin_used * 100.0) if margin_used else 0.0
+            
+            symbol_item = QtWidgets.QTableWidgetItem(f"{display_symbol}\nБесср {leverage}x")
+            symbol_item.setForeground(QtGui.QColor("#0ECB81") if side == 'LONG' else QtGui.QColor("#F6465D"))
             self.positions_widget.setItem(row, 0, symbol_item)
             
-            # Column 1: Leverage (вместо Direction)
-            leverage_item = QtWidgets.QTableWidgetItem(f"{leverage}x")
-            self.positions_widget.setItem(row, 1, leverage_item)
+            volume_item = QtWidgets.QTableWidgetItem(f"{notional:,.4f} USDT")
+            self.positions_widget.setItem(row, 1, volume_item)
+            self.positions_widget.setItem(row, 2, QtWidgets.QTableWidgetItem(f"{entry_price:,.4f}"))
+            self.positions_widget.setItem(row, 3, QtWidgets.QTableWidgetItem(f"{break_even:,.4f}"))
+            self.positions_widget.setItem(row, 4, QtWidgets.QTableWidgetItem(f"{mark_price:,.4f}"))
+            liq_item = QtWidgets.QTableWidgetItem(f"{liquidation:,.4f}")
+            liq_item.setForeground(QtGui.QColor("#F6465D"))
+            self.positions_widget.setItem(row, 5, liq_item)
+            margin_ratio_item = QtWidgets.QTableWidgetItem(f"{margin_ratio:.2f}%")
+            self.positions_widget.setItem(row, 6, margin_ratio_item)
+            self.positions_widget.setItem(row, 7, QtWidgets.QTableWidgetItem(f"{margin_used:,.4f} USDT"))
             
-            # Column 2-8: Entry, Current, Size, SL, TP, PNL, USDT
-            self.positions_widget.setItem(row, 2, QtWidgets.QTableWidgetItem(f"{entry_price:,.2f}"))
-            self.positions_widget.setItem(row, 3, QtWidgets.QTableWidgetItem(f"{current_price:,.2f}"))
-            self.positions_widget.setItem(row, 4, QtWidgets.QTableWidgetItem(f"{size:,.4f}"))
-            self.positions_widget.setItem(row, 5, QtWidgets.QTableWidgetItem(f"{stop_loss:,.2f}"))
-            self.positions_widget.setItem(row, 6, QtWidgets.QTableWidgetItem(f"{take_profit:,.2f}"))
+            pnl_item = QtWidgets.QTableWidgetItem(f"{unrealized:+.4f} USDT ({roi:+.2f}%)")
+            pnl_item.setForeground(QtGui.QColor("#0ECB81") if unrealized >= 0 else QtGui.QColor("#F6465D"))
+            self.positions_widget.setItem(row, 8, pnl_item)
             
-            pnl_item = QtWidgets.QTableWidgetItem(f"{pnl:+.2f}")
-            pnl_item.setForeground(QtGui.QColor("#0ECB81") if pnl >= 0 else QtGui.QColor("#F6465D"))
-            self.positions_widget.setItem(row, 7, pnl_item)
-            
-            # Column 8: Position size in USDT (without leverage)
-            self.positions_widget.setItem(row, 8, QtWidgets.QTableWidgetItem(f"${position_value_usdt:,.2f}"))
-            
-            # Column 9: Close button
-            # Check if button already exists for this row
             existing_widget = self.positions_widget.cellWidget(row, 9)
             if existing_widget is None:
-                # Create container for centering
                 container = QtWidgets.QWidget()
                 container_layout = QtWidgets.QHBoxLayout(container)
                 container_layout.setContentsMargins(0, 0, 0, 0)
@@ -662,7 +711,7 @@ class TradingPrototype(QtWidgets.QMainWindow):
                         font-weight: 600;
                         padding: 2px 6px;
                         min-width: 40px;
-                        max-width: 40px;
+                        max-width: 50px;
                         min-height: 16px;
                         max-height: 16px;
                     }
@@ -679,19 +728,17 @@ class TradingPrototype(QtWidgets.QMainWindow):
                         border-color: rgba(107, 114, 128, 0.25);
                     }
                 """)
-                # Store symbol as property to avoid lambda issues
                 close_btn.setProperty("symbol", symbol)
                 close_btn.clicked.connect(self._on_close_button_clicked)
                 
                 container_layout.addWidget(close_btn)
                 self.positions_widget.setCellWidget(row, 9, container)
             else:
-                # Update existing button's symbol property
                 close_btn = existing_widget.findChild(QtWidgets.QPushButton)
                 if close_btn:
                     close_btn.setProperty("symbol", symbol)
-                    close_btn.setEnabled(True)  # Re-enable if it was disabled
-                    close_btn.setText("Закрыть")  # Reset text if it was changed
+                    close_btn.setEnabled(True)
+                    close_btn.setText("Закрыть")
     
     def update_history_data(self, closed_trades: list):
         """Update history table."""
@@ -707,33 +754,25 @@ class TradingPrototype(QtWidgets.QMainWindow):
         self.history_widget.setRowCount(len(recent_trades))
         
         for row, trade in enumerate(reversed(recent_trades)):
-            # trade is ClosedTrade object, not dict
-            close_time = trade.close_time if hasattr(trade, 'close_time') else datetime.now()
-            time_str = close_time.strftime("%d.%m %H:%M") if isinstance(close_time, datetime) else str(close_time)
-            self.history_widget.setItem(row, 0, QtWidgets.QTableWidgetItem(time_str))
-            
-            # Column 1: Symbol
             symbol = trade.symbol if hasattr(trade, 'symbol') else ''
-            self.history_widget.setItem(row, 1, QtWidgets.QTableWidgetItem(symbol))
+            self.history_widget.setItem(row, 0, QtWidgets.QTableWidgetItem(symbol))
             
-            # Column 2: Direction
             direction = trade.side if hasattr(trade, 'side') else ''
             direction_item = QtWidgets.QTableWidgetItem(direction)
             direction_item.setForeground(
                 QtGui.QColor("#0ECB81") if direction == 'LONG' else QtGui.QColor("#F6465D")
             )
-            self.history_widget.setItem(row, 2, direction_item)
+            self.history_widget.setItem(row, 1, direction_item)
             
-            # Column 3-5: Entry, Exit, PNL
             entry_price = trade.entry_price if hasattr(trade, 'entry_price') else 0
             exit_price = trade.exit_price if hasattr(trade, 'exit_price') else 0
-            self.history_widget.setItem(row, 3, QtWidgets.QTableWidgetItem(f"{entry_price:,.2f}"))
-            self.history_widget.setItem(row, 4, QtWidgets.QTableWidgetItem(f"{exit_price:,.2f}"))
+            self.history_widget.setItem(row, 2, QtWidgets.QTableWidgetItem(f"{entry_price:,.4f}"))
+            self.history_widget.setItem(row, 3, QtWidgets.QTableWidgetItem(f"{exit_price:,.4f}"))
             
             pnl = trade.pnl if hasattr(trade, 'pnl') else 0
-            pnl_item = QtWidgets.QTableWidgetItem(f"{pnl:+.2f}")
+            pnl_item = QtWidgets.QTableWidgetItem(f"{pnl:+.4f}")
             pnl_item.setForeground(QtGui.QColor("#0ECB81") if pnl >= 0 else QtGui.QColor("#F6465D"))
-            self.history_widget.setItem(row, 5, pnl_item)
+            self.history_widget.setItem(row, 4, pnl_item)
         
         self.history_widget.setSortingEnabled(True)
 
@@ -769,6 +808,14 @@ class TradingPrototype(QtWidgets.QMainWindow):
             self.orders_widget.setItem(row, 5, QtWidgets.QTableWidgetItem(status))
 
         self.orders_widget.setSortingEnabled(True)
+
+    @QtCore.Slot(bool, str)
+    def set_start_button_state(self, enabled: bool, label: str = ""):
+        """External control for Start button."""
+        if hasattr(self, "start_button"):
+            self.start_button.setEnabled(enabled)
+            if label:
+                self.start_button.setText(label)
 
 
 def main():

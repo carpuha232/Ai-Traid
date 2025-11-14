@@ -189,6 +189,25 @@ class ActivityLogWidget(QtWidgets.QTextEdit):
             self.verticalScrollBar().setValue(self.verticalScrollBar().maximum())
         
         self._trim_lines()
+
+    def add_trade_event(self, title: str, details: dict):
+        """Generic trade event with structured details."""
+        timestamp = datetime.now().strftime("%H:%M:%S")
+        rows = "".join(
+            f"<span style='color: #A2A9B4; margin-left: 20px;'>• {key}: {value}<br/></span>"
+            for key, value in details.items()
+        )
+        html = f"""
+        <div style='margin-bottom: 8px;'>
+            <span style='color: #7E8794;'>{timestamp}</span>
+            <span style='color: #F0B90B; font-weight: bold;'> ⚙️ {title}</span><br/>
+            {rows}
+        </div>
+        """
+        self.append(html)
+        if self.auto_scroll:
+            self.verticalScrollBar().setValue(self.verticalScrollBar().maximum())
+        self._trim_lines()
     
     def add_reject_liquidity(self, symbol: str, wall_score: float, spread_score: float):
         """Add liquidity rejection entry."""
@@ -364,13 +383,27 @@ class PositionsWidget(MockTable):
     
     def __init__(self, parent=None) -> None:
         super().__init__(0, 10, parent)
-        self.setHorizontalHeaderLabels(["Пара", "Плечо", "Вход", "Текущая", "Размер", "SL", "TP", "PNL", "USDT", ""])
-        # Don't populate mock data - wait for real data from bot
-        # DISABLE sorting - it causes rows to jump and buttons to disconnect
+        self.setHorizontalHeaderLabels([
+            "Символ",
+            "Размер",
+            "Вход",
+            "Безубыток",
+            "Маркет",
+            "Ликвидация",
+            "Коэф.",
+            "Маржа",
+            "PNL (ROI)",
+            ""
+        ])
         self.setSortingEnabled(False)
-        self.horizontalHeader().setSectionResizeMode(9, QtWidgets.QHeaderView.ResizeMode.Fixed)
-        self.setColumnWidth(9, 65)  # Fixed width for close button column (smaller)
-        # DISABLE cell selection - no blue highlighting
+        header = self.horizontalHeader()
+        header.setSectionResizeMode(QtWidgets.QHeaderView.ResizeMode.Stretch)
+        header.setSectionResizeMode(0, QtWidgets.QHeaderView.ResizeMode.ResizeToContents)
+        header.setSectionResizeMode(1, QtWidgets.QHeaderView.ResizeMode.ResizeToContents)
+        header.setSectionResizeMode(5, QtWidgets.QHeaderView.ResizeMode.ResizeToContents)
+        header.setSectionResizeMode(6, QtWidgets.QHeaderView.ResizeMode.ResizeToContents)
+        header.setSectionResizeMode(9, QtWidgets.QHeaderView.ResizeMode.Fixed)
+        self.setColumnWidth(9, 80)
         self.setSelectionMode(QtWidgets.QAbstractItemView.SelectionMode.NoSelection)
 
     def populate_mock_data(self):
@@ -412,9 +445,8 @@ class OrdersWidget(MockTable):
 
 class HistoryWidget(MockTable):
     def __init__(self, parent=None) -> None:
-        super().__init__(0, 6, parent)
-        self.setHorizontalHeaderLabels(["Время", "Пара", "Направление", "Вход", "Выход", "PNL"])
-        # Don't populate mock data - wait for real data from bot
+        super().__init__(0, 5, parent)
+        self.setHorizontalHeaderLabels(["Пара", "Напр.", "Вход", "Выход", "PNL"])
         self.setSortingEnabled(True)
 
     def populate_mock_data(self):

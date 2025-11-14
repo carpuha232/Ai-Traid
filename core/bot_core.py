@@ -150,9 +150,31 @@ class BotCore:
                 filename = f"results/autosave_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
                 Path("results").mkdir(exist_ok=True)
                 self.bot.paper_trader.save_session(filename)
+                self._prune_autosaves(keep=3)
                 # Autosave silent - only log errors
                 
                 self.bot._last_signal_log = datetime.now()
         else:
             self.bot._last_signal_log = datetime.now()
+
+    def _prune_autosaves(self, keep: int = 3):
+        """Keep only the most recent `keep` autosave files."""
+        if keep <= 0:
+            return
+
+        autosave_dir = Path("results")
+        if not autosave_dir.exists():
+            return
+
+        autosave_files = sorted(
+            autosave_dir.glob("autosave_*.json"),
+            key=lambda p: p.stat().st_mtime,
+            reverse=True,
+        )
+
+        for old_file in autosave_files[keep:]:
+            try:
+                old_file.unlink(missing_ok=True)
+            except Exception as exc:
+                logger.warning("Failed to delete old autosave %s: %s", old_file, exc)
 

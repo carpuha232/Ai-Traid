@@ -17,7 +17,7 @@ import logging
 import math
 from dataclasses import dataclass, field, asdict
 from datetime import datetime
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Any
 
 logger = logging.getLogger(__name__)
 
@@ -39,6 +39,7 @@ class Position:
     margin_usdt: float = 0.0  # capital locked for the position (notional / leverage)
     position_value_usdt: float = 0.0  # notional exposure without leverage
     order_type: str = "LIMIT"
+    averaging_orders: List[Dict[str, Any]] = field(default_factory=list)
 
 
 @dataclass
@@ -260,7 +261,7 @@ class PaperTrader:
             "closed_trades": [asdict(trade) for trade in self.closed_trades],
         }
         with open(path, "w", encoding="utf-8") as f:
-            json.dump(snapshot, f, ensure_ascii=False, indent=2)
+            json.dump(snapshot, f, ensure_ascii=False, indent=2, default=self._json_default)
 
     # ------------------------------------------------------------------ #
     # Internal helpers
@@ -302,5 +303,11 @@ class PaperTrader:
         # align to step size upwards to satisfy notional
         steps = math.ceil(qty / step)
         return round(steps * step, 8)
+
+    @staticmethod
+    def _json_default(obj):
+        if isinstance(obj, datetime):
+            return obj.isoformat()
+        return obj
 
 

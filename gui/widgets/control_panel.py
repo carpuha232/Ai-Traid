@@ -129,12 +129,12 @@ class ControlPanel(QtWidgets.QFrame):
 
     def update_balance(self, balance: float) -> None:
         value_label = self.balance_label.findChild(QtWidgets.QLabel, "MetricValue")
-        value_label.setText(f"${balance:,.2f}")
+        value_label.setText(f"${balance:,.4f}")
 
     def update_pnl(self, pnl: float) -> None:
         value_label = self.pnl_label.findChild(QtWidgets.QLabel, "MetricValue")
         sign = "+" if pnl >= 0 else ""
-        value_label.setText(f"{sign}${pnl:,.2f}")
+        value_label.setText(f"{sign}${pnl:,.4f}")
         value_label.setProperty("accentRole", "positive" if pnl >= 0 else "negative")
         self._refresh_widget(value_label)
 

@@ -103,13 +103,17 @@ class AutoScalpingBot:
 
         # Базовый снимок реального аккаунта через Binance API
         self.live_account_overview = self.binance_client.get_account_overview()
+        self._last_live_overview_refresh = datetime.now().timestamp() if self.live_account_overview else 0.0
+        display_cfg = self.config.get('display', {})
+        self.live_balance_refresh_interval = max(5.0, float(display_cfg.get('balance_refresh_interval', 15.0)))
+        live_wallet_balance = 0.0
         if self.live_account_overview:
-            wallet = self.live_account_overview.get('walletBalance', 0.0)
+            live_wallet_balance = self.live_account_overview.get('walletBalance', 0.0)
             available = self.live_account_overview.get('availableBalance', 0.0)
             unrealized = self.live_account_overview.get('unrealizedProfit', 0.0)
             logger.info(
                 "💼 Фактический баланс Binance Futures: wallet=$%.2f | available=$%.2f | unrealized PnL=$%.2f",
-                wallet,
+                live_wallet_balance,
                 available,
                 unrealized,
             )
@@ -122,6 +126,9 @@ class AutoScalpingBot:
         self.is_live_mode = self.mode == 'live_trading'
         account_cfg = self.config.get('account', {})
         starting_balance = float(account_cfg.get('starting_balance', 0.0))
+        if live_wallet_balance > 0:
+            starting_balance = live_wallet_balance
+            self.config['account']['starting_balance'] = live_wallet_balance
 
         if self.is_live_mode:
             live_balance = float(self.live_account_overview.get('walletBalance', 0.0))
@@ -137,7 +144,6 @@ class AutoScalpingBot:
                     starting_balance,
                 )
 
-            display_cfg = self.config.get('display', {})
             refresh_interval = max(1.0, float(display_cfg.get('update_interval', 1.0)))
             self.paper_trader = LiveTrader(
                 self.config,
@@ -169,6 +175,7 @@ class AutoScalpingBot:
             'last_error': None,
             'backoff': 0.5
         }
+        self._loop: asyncio.AbstractEventLoop | None = None
         
         # Strictness (fixed at 50% - Moderate mode)
         self.strictness_percent = 50.0
@@ -177,6 +184,37 @@ class AutoScalpingBot:
         self.core = BotCore(self)
         
         logger.info("✅ All components initialised")
+
+    def _maybe_refresh_live_account_overview(self, force: bool = False):
+        """Periodic полная загрузка баланса через REST независимо от режима."""
+        if not self.config.get('api') or not self.binance_client:
+            return self.live_account_overview
+
+        now_ts = datetime.now().timestamp()
+        if (
+            not force
+            and self._last_live_overview_refresh
+            and (now_ts - self._last_live_overview_refresh) < self.live_balance_refresh_interval
+        ):
+            return self.live_account_overview
+
+        snapshot = self.binance_client.get_account_overview()
+        if snapshot:
+            self.live_account_overview = snapshot
+            self._last_live_overview_refresh = now_ts
+        return self.live_account_overview
+
+    def _get_display_balance_value(self) -> float:
+        """Значение баланса, которое нужно показывать в GUI/консоли."""
+        if self.live_account_overview:
+            return self.live_account_overview.get('walletBalance', self.paper_trader.balance)
+        return self.paper_trader.balance
+
+    def _get_display_pnl_value(self) -> float:
+        """Фактический PnL (для live — unrealized)."""
+        if self.live_account_overview:
+            return self.live_account_overview.get('unrealizedProfit', 0.0)
+        return self.paper_trader.balance - self.paper_trader.starting_balance
     
     def close_position(self, symbol: str, order_type: str = 'Manual'):
         """Close a specific position via GUI."""
@@ -265,6 +303,100 @@ class AutoScalpingBot:
                 logger.warning(f"⚠️ Failed to close position {symbol}")
         else:
             logger.warning(f"⚠️ Position {symbol} not found")
+
+    def _on_start_position_requested(self, symbol: str = ""):
+        """Handle manual Start button click."""
+        if not self.is_live_mode or not isinstance(self.paper_trader, LiveTrader):
+            logger.warning("Start button is available only in LIVE mode.")
+            if self.gui:
+                self.gui.set_start_button_state(False, "Только LIVE")
+            return
+
+        if not self.running or not self._loop:
+            logger.warning("Cannot open position: bot loop is not ready.")
+            return
+
+        if self.gui:
+            self.gui.set_start_button_state(False, "Открытие...")
+
+        target_symbol = symbol or (self.pairs[0] if self.pairs else "XRPUSDT")
+        future = asyncio.run_coroutine_threadsafe(
+            self._handle_manual_long_entry(target_symbol),
+            self._loop
+        )
+        future.add_done_callback(self._on_manual_start_finished)
+
+    async def _handle_manual_long_entry(self, symbol: str):
+        """Run blocking live-entry logic in a thread."""
+        live_trader: LiveTrader = self.paper_trader  # type: ignore
+        result = await asyncio.to_thread(
+            live_trader.open_min_long_with_averaging,
+            symbol,
+        )
+        self._update_gui()
+        return result
+
+    def _on_manual_start_finished(self, future):
+        """Callback after manual start completes."""
+        success_label = "Старт"
+        try:
+            payload = future.result()
+            default_symbol = self.pairs[0] if self.pairs else "XRPUSDT"
+            symbol = payload.get("symbol", default_symbol)
+            key = f"{symbol}|LONG"
+            position = self.paper_trader.positions.get(key)
+
+            liq = payload.get("liquidation_price") or (getattr(position, "liquidation_price", 0.0) if position else 0.0)
+            grid_orders = payload.get("grid_orders") or (getattr(position, "averaging_orders", None) if position else None) or []
+            avg_price = grid_orders[0]["price"] if grid_orders else 0.0
+            entry = payload.get("entry_price") or (position.entry_price if position else 0.0)
+            qty = payload.get("base_quantity") or (position.size if position else 0.0)
+            logger.info(
+                "🟢 Manual live entry opened. Entry=%.4f qty=%.4f | Liq=%.4f | Averaging=%.4f",
+                entry,
+                qty,
+                liq,
+                avg_price,
+            )
+            self._notify_status_bar("Позиция открыта, усреднение выставлено.")
+            if self.gui and hasattr(self.gui, "activity_log"):
+                details = {
+                    "Вход": f"{entry:.4f}",
+                    "Объём": f"{qty:.4f} XRP",
+                    "Ликвидация": f"{liq:.4f}",
+                    "Усреднение": f"{avg_price:.4f}",
+                }
+                self.gui.activity_log.add_trade_event("Live позиция открыта", details)
+        except Exception as exc:
+            logger.error("❌ Manual start failed: %s", exc, exc_info=True)
+            self._notify_status_bar(f"Ошибка открытия позиции: {exc}")
+        finally:
+            self._schedule_start_button_state(True, success_label)
+
+    def _schedule_start_button_state(self, enabled: bool, label: str):
+        if not self.gui:
+            return
+        QtCore.QMetaObject.invokeMethod(
+            self.gui,
+            "set_start_button_state",
+            QtCore.Qt.ConnectionType.QueuedConnection,
+            QtCore.Q_ARG(bool, enabled),
+            QtCore.Q_ARG(str, label),
+        )
+
+    def _notify_status_bar(self, message: str, timeout: int = 5000):
+        if not self.gui:
+            return
+        status_bar = self.gui.statusBar()
+        if not status_bar:
+            return
+        QtCore.QMetaObject.invokeMethod(
+            status_bar,
+            "showMessage",
+            QtCore.Qt.ConnectionType.QueuedConnection,
+            QtCore.Q_ARG(str, message),
+            QtCore.Q_ARG(int, timeout),
+        )
     
     def _safe_gui_call(self, signal, *args):
         """Emit Qt signal for thread-safe GUI updates."""
@@ -317,6 +449,9 @@ class AutoScalpingBot:
                 await asyncio.sleep(0.2)
             
             logger.info("🚀 Bot is running and monitoring the market...")
+
+            if self.is_live_mode and isinstance(self.paper_trader, LiveTrader):
+                await self.paper_trader.start_user_stream()
             
             # Main loop
             while self.running:
@@ -389,15 +524,34 @@ class AutoScalpingBot:
                 return
             
             if self.is_live_mode and isinstance(self.paper_trader, LiveTrader):
-                account_snapshot = self.paper_trader.refresh_from_exchange()
-                balance_value = account_snapshot.get('walletBalance', self.paper_trader.balance)
-                pnl_value = account_snapshot.get('unrealizedProfit', 0.0)
+                account_snapshot = self.paper_trader.get_account_overview()
+                if account_snapshot:
+                    self.live_account_overview = account_snapshot
+                    self._last_live_overview_refresh = datetime.now().timestamp()
+                balance_value = self.live_account_overview.get('walletBalance', self.paper_trader.balance)
+                pnl_value = self.live_account_overview.get('unrealizedProfit', 0.0)
                 win_rate_value = 0.0
                 drawdown_value = 0.0
                 positions_count = len(self.paper_trader.positions)
+
+                for pos in self.paper_trader.positions.values():
+                    need_liq = getattr(pos, 'liquidation_price', 0.0) <= 0
+                    need_be = getattr(pos, 'break_even_price', 0.0) <= 0
+                    info = None
+                    if need_liq or need_be:
+                        info = self.paper_trader.get_cached_position_info(pos.symbol)
+                    if need_liq and info:
+                        setattr(pos, 'liquidation_price', float(info.get('liquidationPrice', 0.0)))
+                    if need_be and info:
+                        setattr(pos, 'break_even_price', float(info.get('breakEvenPrice', pos.entry_price)))
             else:
-                balance_value = self.paper_trader.balance
-                pnl_value = balance_value - self.paper_trader.starting_balance
+                snapshot = self._maybe_refresh_live_account_overview()
+                if snapshot:
+                    balance_value = snapshot.get('walletBalance', self.paper_trader.balance)
+                    pnl_value = snapshot.get('unrealizedProfit', 0.0)
+                else:
+                    balance_value = self.paper_trader.balance
+                    pnl_value = balance_value - self.paper_trader.starting_balance
                 stats = self.paper_trader.get_statistics()
                 win_rate_value = stats['win_rate']
                 drawdown_value = self.paper_trader.max_drawdown
@@ -459,7 +613,10 @@ class AutoScalpingBot:
                 for key in self.paper_trader.positions.keys()
             }
             self.paper_trader.close_all_positions(current_prices)
-        
+
+        if self.is_live_mode and isinstance(self.paper_trader, LiveTrader):
+            await self.paper_trader.stop_user_stream()
+
         await self.binance_client.stop()
         logger.info("✅ Disconnected from Binance")
         
@@ -500,6 +657,7 @@ class AutoScalpingBot:
         try:
             loop = asyncio.new_event_loop()
             asyncio.set_event_loop(loop)
+            self._loop = loop
             loop.run_until_complete(self.start())
         except KeyboardInterrupt:
             logger.info("⏹️ Ctrl+C received in asyncio thread")
@@ -515,12 +673,13 @@ class AutoScalpingBot:
                 self.app = QtWidgets.QApplication(sys.argv)
             
             # Create main window
-            self.gui = TradingPrototype()
+            self.gui = TradingPrototype(self.pairs)
             self.gui.show()
             
             # Connect GUI signals to bot methods
             self.gui.control_panel.connectionToggled.connect(self._on_connection_toggle)
             self.gui.positions_widget.closePositionRequested.connect(self._on_close_position_requested)
+            self.gui.start_position_requested.connect(self._on_start_position_requested)
             
             # Set close callback
             self.app.aboutToQuit.connect(self._on_window_close)
@@ -532,12 +691,15 @@ class AutoScalpingBot:
             stats = self.paper_trader.get_statistics()
             self._safe_gui_call(
                 self.gui.update_account_signal,
-                self.paper_trader.balance,  # balance
-                0.0,  # pnl
+                self._get_display_balance_value(),  # balance
+                self._get_display_pnl_value(),  # pnl
                 stats['win_rate'],  # winrate
                 0.0,  # drawdown
                 0  # positions_count
             )
+
+            start_label = "Старт" if self.is_live_mode else "Только LIVE"
+            self.gui.set_start_button_state(self.is_live_mode, start_label)
             
             logger.info("🚀 Auto-starting bot...")
             asyncio_thread = threading.Thread(target=self._asyncio_thread, daemon=True)
@@ -580,7 +742,7 @@ def main():
     print("="*60)
     print()
     print("Configuration:")
-    print(f"  Starting balance: ${bot.config['account']['starting_balance']}")
+    print(f"  Starting balance: ${float(bot.config['account']['starting_balance']):,.4f}")
     print(f"  Leverage: {bot.config['account']['leverage']}x")
     print(f"  Pairs: {len(bot.config['pairs'])}")
     print(f"  Minimum confidence: {bot.config['signals']['min_confidence']}%")
@@ -588,9 +750,9 @@ def main():
         snapshot = bot.live_account_overview
         print()
         print("Live Binance Futures (API):")
-        print(f"  Wallet balance: ${snapshot.get('walletBalance', 0.0):,.2f}")
-        print(f"  Available: ${snapshot.get('availableBalance', 0.0):,.2f}")
-        print(f"  Unrealized PnL: ${snapshot.get('unrealizedProfit', 0.0):,.2f}")
+        print(f"  Wallet balance: ${snapshot.get('walletBalance', 0.0):,.4f}")
+        print(f"  Available: ${snapshot.get('availableBalance', 0.0):,.4f}")
+        print(f"  Unrealized PnL: ${snapshot.get('unrealizedProfit', 0.0):,.4f}")
     print()
     print("Starting bot...")
     print("To stop: press Ctrl+C or close the GUI window")
