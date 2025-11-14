@@ -9,16 +9,17 @@ import logging
 import sys
 import traceback
 import threading
+import json
 from pathlib import Path
 from datetime import datetime
+import os
 
 # Internal modules
 from core.binance_client import BinanceRealtimeClient
 from core.signal_analyzer import SignalAnalyzer
-from core.config_manager import ConfigManager
 from core.bot_core import BotCore
-from simulation.paper_trader import PaperTrader
 from core.live_trader import LiveTrader
+from simulation.paper_trader import PaperTrader
 
 # Qt GUI
 from PySide6 import QtWidgets, QtCore
@@ -46,6 +47,16 @@ def global_exception_handler(exc_type, exc_value, exc_traceback):
 
 sys.excepthook = global_exception_handler
 
+# Ensure working directory is the script directory (robust start)
+BASE_DIR = Path(__file__).resolve().parent
+try:
+    os.chdir(BASE_DIR)
+except Exception:
+    pass
+
+# Ensure logs directory exists before configuring logging
+Path("logs").mkdir(exist_ok=True)
+
 # Logging setup
 logging.basicConfig(
     level=logging.INFO,  # Changed from DEBUG to INFO
@@ -67,14 +78,17 @@ class AutoScalpingBot:
     def __init__(self, config_path: str = "config.json"):
         """Initialise bot dependencies and state."""
         try:
-            self.config_manager = ConfigManager(config_path)
-            self.config = self.config_manager.config
+            # Простая загрузка конфига через json
+            with open(config_path, 'r', encoding='utf-8') as f:
+                self.config = json.load(f)
             
+            logger.info("✅ Configuration loaded from config.json")
             logger.info("="*60)
             logger.info("🤖 AUTO SCALPING BOT - CONSOLIDATED RELEASE")
             logger.info("="*60)
             
-            if self.config['api']['key'] == "INSERT_YOUR_API_KEY_HERE":
+            api_key = self.config['api']['key']
+            if api_key in {"INSERT_YOUR_API_KEY_HERE", "your_binance_api_key_here", ""}:
                 logger.error("❌ API keys are not configured! Update config.json.")
                 raise ValueError("API keys are not configured")
         except Exception as e:
@@ -86,22 +100,57 @@ class AutoScalpingBot:
             self.config['api']['key'],
             self.config['api']['secret']
         )
+
+        # Базовый снимок реального аккаунта через Binance API
+        self.live_account_overview = self.binance_client.get_account_overview()
+        if self.live_account_overview:
+            wallet = self.live_account_overview.get('walletBalance', 0.0)
+            available = self.live_account_overview.get('availableBalance', 0.0)
+            unrealized = self.live_account_overview.get('unrealizedProfit', 0.0)
+            logger.info(
+                "💼 Фактический баланс Binance Futures: wallet=$%.2f | available=$%.2f | unrealized PnL=$%.2f",
+                wallet,
+                available,
+                unrealized,
+            )
+        else:
+            logger.warning("⚠️ Не удалось получить баланс Binance через API (см. лог).")
         
         self.signal_analyzer = SignalAnalyzer(self.config)
-        self.signal_analyzer.set_trading_mode("Moderate")
+        
+        self.mode = self.config.get('mode', 'paper_trading').lower()
+        self.is_live_mode = self.mode == 'live_trading'
+        account_cfg = self.config.get('account', {})
+        starting_balance = float(account_cfg.get('starting_balance', 0.0))
 
-        self.mode = self.config.get('mode', 'paper_trading')
-        if self.mode == 'live_trading':
+        if self.is_live_mode:
+            live_balance = float(self.live_account_overview.get('walletBalance', 0.0))
+            if live_balance <= 0:
+                live_balance = float(self.binance_client.get_account_balance())
+            if live_balance > 0:
+                starting_balance = live_balance
+                self.config['account']['starting_balance'] = live_balance
+                logger.info(f"💰 Binance futures wallet balance detected: ${live_balance:,.2f}")
+            else:
+                logger.warning(
+                    "⚠️ Could not fetch live futures balance, keeping configured starting balance %.2f",
+                    starting_balance,
+                )
+
+            display_cfg = self.config.get('display', {})
+            refresh_interval = max(1.0, float(display_cfg.get('update_interval', 1.0)))
             self.paper_trader = LiveTrader(
                 self.config,
                 self.config['api']['key'],
-                self.config['api']['secret']
+                self.config['api']['secret'],
+                starting_balance,
+                refresh_interval=refresh_interval
             )
-            logger.info("🚀 Trading mode: LIVE")
+            logger.info("🎯 Trading mode: LIVE (read-only account sync)")
         else:
             self.paper_trader = PaperTrader(
                 self.config,
-                self.config['account']['starting_balance']
+                starting_balance
             )
             logger.info("🎯 Trading mode: PAPER")
         
@@ -132,7 +181,8 @@ class AutoScalpingBot:
     def close_position(self, symbol: str, order_type: str = 'Manual'):
         """Close a specific position via GUI."""
         if symbol in self.paper_trader.positions:
-            current_price = self.binance_client.get_current_price(symbol)
+            raw_symbol = symbol.split('|')[0]
+            current_price = self.binance_client.get_current_price(raw_symbol)
             if current_price > 0:
                 closed_trade = self.paper_trader.close_position_manually(
                     symbol, current_price, order_type
@@ -150,8 +200,8 @@ class AutoScalpingBot:
         
         logger.warning("🚨 Emergency: closing all positions")
         current_prices = {
-            symbol: self.binance_client.get_current_price(symbol)
-            for symbol in list(self.paper_trader.positions.keys())
+            key: self.binance_client.get_current_price(key.split('|')[0])
+            for key in list(self.paper_trader.positions.keys())
         }
         self.paper_trader.close_all_positions(current_prices)
         logger.info(f"✅ Closed {len(current_prices)} positions")
@@ -184,7 +234,8 @@ class AutoScalpingBot:
         # Get position data before closing
         if symbol in self.paper_trader.positions:
             position = self.paper_trader.positions[symbol]
-            current_price = self.binance_client.get_current_price(symbol)
+            raw_symbol = symbol.split('|')[0]
+            current_price = self.binance_client.get_current_price(raw_symbol)
             
             # Calculate PNL before closing
             if position.side == 'LONG':
@@ -337,17 +388,28 @@ class AutoScalpingBot:
             if not self.running or not self.gui:
                 return
             
-            # Update account metrics
-            pnl = self.paper_trader.balance - self.paper_trader.starting_balance
-            stats = self.paper_trader.get_statistics()
+            if self.is_live_mode and isinstance(self.paper_trader, LiveTrader):
+                account_snapshot = self.paper_trader.refresh_from_exchange()
+                balance_value = account_snapshot.get('walletBalance', self.paper_trader.balance)
+                pnl_value = account_snapshot.get('unrealizedProfit', 0.0)
+                win_rate_value = 0.0
+                drawdown_value = 0.0
+                positions_count = len(self.paper_trader.positions)
+            else:
+                balance_value = self.paper_trader.balance
+                pnl_value = balance_value - self.paper_trader.starting_balance
+                stats = self.paper_trader.get_statistics()
+                win_rate_value = stats['win_rate']
+                drawdown_value = self.paper_trader.max_drawdown
+                positions_count = len(self.paper_trader.positions)
             
             self._safe_gui_call(
                 self.gui.update_account_signal,
-                self.paper_trader.balance,
-                pnl,
-                stats['win_rate'],
-                self.paper_trader.max_drawdown,
-                len(self.paper_trader.positions)
+                balance_value,
+                pnl_value,
+                win_rate_value,
+                drawdown_value,
+                positions_count
             )
             
             # Update signals table
@@ -355,14 +417,23 @@ class AutoScalpingBot:
             
             # Update positions table
             current_prices = {
-                symbol: self.binance_client.get_current_price(symbol)
-                for symbol in self.paper_trader.positions.keys()
+                key: self.binance_client.get_current_price(key.split('|')[0])
+                for key in self.paper_trader.positions.keys()
             }
             self._safe_gui_call(
                 self.gui.update_positions_signal,
                 self.paper_trader.positions,
                 current_prices
             )
+
+            # Update open orders (live mode only)
+            if hasattr(self.gui, 'update_orders_signal'):
+                orders_payload = (
+                    self.paper_trader.get_open_orders()
+                    if self.is_live_mode and hasattr(self.paper_trader, 'get_open_orders')
+                    else []
+                )
+                self._safe_gui_call(self.gui.update_orders_signal, orders_payload)
             
             # Update history table
             self._safe_gui_call(
@@ -384,8 +455,8 @@ class AutoScalpingBot:
         if self.paper_trader.positions:
             logger.info("Closing all open positions...")
             current_prices = {
-                symbol: self.binance_client.get_current_price(symbol)
-                for symbol in self.paper_trader.positions.keys()
+                key: self.binance_client.get_current_price(key.split('|')[0])
+                for key in self.paper_trader.positions.keys()
             }
             self.paper_trader.close_all_positions(current_prices)
         
@@ -456,6 +527,18 @@ class AutoScalpingBot:
             
             # Auto-start bot immediately
             self.paused = False  # Enable trading from the start
+            
+            # ⚡ МГНОВЕННОЕ отображение начального баланса (до подключения к Binance)
+            stats = self.paper_trader.get_statistics()
+            self._safe_gui_call(
+                self.gui.update_account_signal,
+                self.paper_trader.balance,  # balance
+                0.0,  # pnl
+                stats['win_rate'],  # winrate
+                0.0,  # drawdown
+                0  # positions_count
+            )
+            
             logger.info("🚀 Auto-starting bot...")
             asyncio_thread = threading.Thread(target=self._asyncio_thread, daemon=True)
             asyncio_thread.start()
@@ -501,6 +584,13 @@ def main():
     print(f"  Leverage: {bot.config['account']['leverage']}x")
     print(f"  Pairs: {len(bot.config['pairs'])}")
     print(f"  Minimum confidence: {bot.config['signals']['min_confidence']}%")
+    if bot.live_account_overview:
+        snapshot = bot.live_account_overview
+        print()
+        print("Live Binance Futures (API):")
+        print(f"  Wallet balance: ${snapshot.get('walletBalance', 0.0):,.2f}")
+        print(f"  Available: ${snapshot.get('availableBalance', 0.0):,.2f}")
+        print(f"  Unrealized PnL: ${snapshot.get('unrealizedProfit', 0.0):,.2f}")
     print()
     print("Starting bot...")
     print("To stop: press Ctrl+C or close the GUI window")

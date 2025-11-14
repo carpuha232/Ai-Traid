@@ -330,25 +330,33 @@ class BinanceRealtimeClient:
                 return False
         return True
     
-    def get_account_balance(self) -> float:
-        """Fetch futures account balance."""
+    def get_account_overview(self) -> Dict[str, float]:
+        """
+        Fetch a snapshot of the Binance Futures account.
+
+        Returns:
+            Dict containing wallet, available, margin balances and unrealised PNL.
+        """
         try:
-            # Lazy client initialisation
             if self.client is None:
                 self.client = Client(self.api_key, self.api_secret)
-            
+
             account = self.client.futures_account()
-            
-            # Extract USDT balance
-            for asset in account['assets']:
-                if asset['asset'] == 'USDT':
-                    return float(asset['walletBalance'])
-            
-            return 0.0
-            
+            overview = {
+                'walletBalance': float(account.get('totalWalletBalance', 0.0)),
+                'availableBalance': float(account.get('availableBalance', 0.0)),
+                'marginBalance': float(account.get('totalMarginBalance', 0.0)),
+                'unrealizedProfit': float(account.get('totalUnrealizedProfit', 0.0)),
+            }
+            return overview
         except Exception as e:
-            logger.error(f"❌ Failed to fetch account balance: {e}")
-            return 0.0
+            logger.error(f"❌ Failed to fetch futures account overview: {e}")
+            return {}
+
+    def get_account_balance(self) -> float:
+        """Convenience shortcut for wallet balance."""
+        overview = self.get_account_overview()
+        return overview.get('walletBalance', 0.0)
     
     def register_orderbook_callback(self, callback: Callable):
         """Register order book update callback."""

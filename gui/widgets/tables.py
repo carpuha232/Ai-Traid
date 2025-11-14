@@ -400,6 +400,16 @@ class PositionsWidget(MockTable):
         self.setSortingEnabled(True)
 
 
+class OrdersWidget(MockTable):
+    """Table for open futures orders."""
+
+    def __init__(self, parent=None) -> None:
+        super().__init__(0, 6, parent)
+        self.setHorizontalHeaderLabels(["Пара", "Сторона", "Тип", "Цена", "Кол-во", "Статус"])
+        self.setSortingEnabled(True)
+        self.setSelectionMode(QtWidgets.QAbstractItemView.SelectionMode.NoSelection)
+
+
 class HistoryWidget(MockTable):
     def __init__(self, parent=None) -> None:
         super().__init__(0, 6, parent)

@@ -5,7 +5,14 @@ Extracted from main_window.py without changes.
 """
 
 from .control_panel import ControlPanel
-from .tables import MockTable, ActivityLogWidget, SignalsWidget, PositionsWidget, HistoryWidget
+from .tables import (
+    MockTable,
+    ActivityLogWidget,
+    SignalsWidget,
+    PositionsWidget,
+    HistoryWidget,
+    OrdersWidget,
+)
 
 __all__ = [
     'ControlPanel',
@@ -14,5 +21,6 @@ __all__ = [
     'SignalsWidget',
     'PositionsWidget',
     'HistoryWidget',
+    'OrdersWidget',
 ]
 

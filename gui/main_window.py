@@ -14,7 +14,14 @@ from PySide6 import QtCore, QtGui, QtWidgets
 
 
 # Import widgets from modular components
-from .widgets import ControlPanel, ActivityLogWidget, SignalsWidget, PositionsWidget, HistoryWidget
+from .widgets import (
+    ControlPanel,
+    ActivityLogWidget,
+    SignalsWidget,
+    PositionsWidget,
+    HistoryWidget,
+    OrdersWidget,
+)
 
 
 
@@ -24,6 +31,7 @@ class TradingPrototype(QtWidgets.QMainWindow):
     update_signals_signal = QtCore.Signal(dict)
     update_positions_signal = QtCore.Signal(dict, dict)
     update_history_signal = QtCore.Signal(list)
+    update_orders_signal = QtCore.Signal(list)
     
     def __init__(self):
         super().__init__()
@@ -37,6 +45,7 @@ class TradingPrototype(QtWidgets.QMainWindow):
         self.update_signals_signal.connect(self.update_signals_data)
         self.update_positions_signal.connect(self.update_positions_data)
         self.update_history_signal.connect(self.update_history_data)
+        self.update_orders_signal.connect(self.update_orders_data)
         self.setDockOptions(
             QtWidgets.QMainWindow.DockOption.AnimatedDocks
             | QtWidgets.QMainWindow.DockOption.AllowNestedDocks
@@ -89,6 +98,7 @@ class TradingPrototype(QtWidgets.QMainWindow):
         container_layout.setSpacing(8)
 
         self.positions_widget = PositionsWidget()
+        self.orders_widget = OrdersWidget()
         self.history_widget = HistoryWidget()
 
         left_splitter = QtWidgets.QSplitter(QtCore.Qt.Orientation.Vertical)
@@ -104,9 +114,15 @@ class TradingPrototype(QtWidgets.QMainWindow):
         positions_frame.setSizePolicy(QtWidgets.QSizePolicy.Policy.Expanding, QtWidgets.QSizePolicy.Policy.Expanding)
         left_splitter.addWidget(positions_frame)
 
+        orders_frame = self._section_frame("Open Orders", self.orders_widget)
+        orders_frame.setMinimumHeight(140)
+        orders_frame.setSizePolicy(QtWidgets.QSizePolicy.Policy.Expanding, QtWidgets.QSizePolicy.Policy.Expanding)
+        left_splitter.addWidget(orders_frame)
+
         left_splitter.setStretchFactor(0, 2)
         left_splitter.setStretchFactor(1, 3)
-        left_splitter.setSizes([220, 280])
+        left_splitter.setStretchFactor(2, 2)
+        left_splitter.setSizes([200, 260, 200])
 
         history_frame = self._section_frame("Trade History", self.history_widget)
         history_frame.setMinimumWidth(350)
@@ -597,8 +613,9 @@ class TradingPrototype(QtWidgets.QMainWindow):
                 # Fallback: calculate from position value / leverage
                 position_value_usdt = (entry_price * size) / leverage
             
-            # Column 0: Symbol (цвет по направлению)
-            symbol_item = QtWidgets.QTableWidgetItem(symbol)
+            # Column 0: Symbol (без суффикса |SIDE), цвет по направлению
+            display_symbol = symbol.split('|')[0] if '|' in symbol else symbol
+            symbol_item = QtWidgets.QTableWidgetItem(display_symbol)
             symbol_item.setForeground(
                 QtGui.QColor("#0ECB81") if side == 'LONG' else QtGui.QColor("#F6465D")
             )
@@ -719,6 +736,39 @@ class TradingPrototype(QtWidgets.QMainWindow):
             self.history_widget.setItem(row, 5, pnl_item)
         
         self.history_widget.setSortingEnabled(True)
+
+    def update_orders_data(self, orders: list):
+        """Update open orders table."""
+        self.orders_widget.setSortingEnabled(False)
+        self.orders_widget.setRowCount(0)
+
+        if not orders:
+            self.orders_widget.setSortingEnabled(True)
+            return
+
+        self.orders_widget.setRowCount(len(orders))
+        for row, order in enumerate(orders):
+            symbol = order.get("symbol", "")
+            side = order.get("side", "")
+            order_type = order.get("type", "")
+            price = float(order.get("price", 0.0) or 0.0)
+            qty = float(order.get("origQty", 0.0) or 0.0)
+            status = order.get("status", "")
+
+            symbol_item = QtWidgets.QTableWidgetItem(symbol)
+            side_item = QtWidgets.QTableWidgetItem(side)
+            side_item.setForeground(
+                QtGui.QColor("#0ECB81") if side.upper() == "BUY" else QtGui.QColor("#F6465D")
+            )
+
+            self.orders_widget.setItem(row, 0, symbol_item)
+            self.orders_widget.setItem(row, 1, side_item)
+            self.orders_widget.setItem(row, 2, QtWidgets.QTableWidgetItem(order_type))
+            self.orders_widget.setItem(row, 3, QtWidgets.QTableWidgetItem(f"{price:,.4f}"))
+            self.orders_widget.setItem(row, 4, QtWidgets.QTableWidgetItem(f"{qty:.4f}"))
+            self.orders_widget.setItem(row, 5, QtWidgets.QTableWidgetItem(status))
+
+        self.orders_widget.setSortingEnabled(True)
 
 
 def main():

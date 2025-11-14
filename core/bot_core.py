@@ -19,62 +19,18 @@ class BotCore:
         """Initialise with a reference to the main bot instance."""
         self.bot = bot_instance
     
-    def _get_strictness_params(self):
-        """Return analysis parameters for current strictness (three modes)."""
-        if self.bot.strictness_percent <= 25:  # Conservative
-            return {
-                'min_confidence': 95.0,
-                'min_trades': 2,
-                'max_price_diff': 0.001
-            }
-        elif self.bot.strictness_percent <= 75:  # Moderate
-            return {
-                'min_confidence': 50.0,
-                'min_trades': 6,
-                'max_price_diff': 0.002
-            }
-        else:  # Aggressive
-            return {
-                'min_confidence': 30.0,
-                'min_trades': 12,
-                'max_price_diff': 0.005
-            }
-    
-    def _calculate_trades_required(self, signal, strictness_params):
-        """Determine the number of trades required for the given mode."""
-        # Lowered requirements - 3 trades minimum instead of 6+
-        if signal.confidence >= 70:
-            return 3
-        elif signal.confidence >= 60:
-            return 4
-        else:
-            return 5
-    
     async def _update_positions(self):
-        """Update open positions."""
-        for symbol in list(self.bot.paper_trader.positions.keys()):
+        """Update open positions (stage 1: mark-to-market only)."""
+        base_symbols = {s.split('|')[0] for s in list(self.bot.paper_trader.positions.keys())}
+        for symbol in base_symbols:
             try:
                 current_price = self.bot.binance_client.get_current_price(symbol)
-                if current_price > 0:
-                    # Get current signal for momentum score
-                    signal = self.bot.current_signals.get(symbol)
-                    momentum_score = getattr(signal, 'momentum_score', 50.0) if signal else 50.0
-                    
-                    closed_trade = self.bot.paper_trader.update_positions(symbol, current_price, momentum_score)
-                    if closed_trade:
-                        self._handle_closed_trade(closed_trade)
-                    
-                    # Pyramiding check: if position in profit and signal strong → add to position
-                    if self.bot.config['risk'].get('use_pyramiding', True):
-                        position = self.bot.paper_trader.positions.get(symbol)
-                        if position and signal and hasattr(signal, 'confidence'):
-                            # Check if can add to position
-                            if self.bot.paper_trader.can_add_to_position(symbol):
-                                # Only add if signal is still strong (same direction + high confidence)
-                                if position.side == 'LONG' and signal.direction == 'LONG' and signal.confidence >= 65:
-                                    self.bot.paper_trader.add_to_position(symbol, current_price, signal.confidence)
-                                elif position.side == 'SHORT' and signal.direction == 'SHORT' and signal.confidence >= 65:
-                                    self.bot.paper_trader.add_to_position(symbol, current_price, signal.confidence)
+                if current_price <= 0:
+                    continue
+
+                closed_trade = self.bot.paper_trader.update_positions(symbol, current_price)
+                if closed_trade:
+                    self._handle_closed_trade(closed_trade)
             except Exception as e:
                 logger.error(f"Failed to update position {symbol}: {e}")
     
@@ -94,161 +50,72 @@ class BotCore:
         """Refresh GUI after closing a position."""
         current_prices_dict = {}
         for pos_symbol in self.bot.paper_trader.positions.keys():
-            pos_price = self.bot.binance_client.get_current_price(pos_symbol)
+            raw_symbol = pos_symbol.split('|')[0]
+            pos_price = self.bot.binance_client.get_current_price(raw_symbol)
             if pos_price > 0:
                 current_prices_dict[pos_symbol] = pos_price
         
-        self.bot._safe_gui_call(self.bot.gui.update_positions, 
+        self.bot._safe_gui_call(self.bot.gui.update_positions_signal, 
                                self.bot.paper_trader.positions, current_prices_dict)
         
-        if hasattr(self.bot.gui, 'update_history'):
-            self.bot._safe_gui_call(self.bot.gui.update_history, self.bot.paper_trader.closed_trades)
-        
-        pnl_sign = "+" if closed_trade.pnl >= 0 else ""
-        event_text = (
-            f"{'✅' if closed_trade.pnl > 0 else '❌'} "
-            f"Closed {closed_trade.symbol} {closed_trade.side}: "
-            f"P&L {pnl_sign}${closed_trade.pnl:.2f} ({pnl_sign}{closed_trade.pnl_percent:.2f}%)"
+        if hasattr(self.bot.gui, 'update_history_signal'):
+            self.bot._safe_gui_call(self.bot.gui.update_history_signal, self.bot.paper_trader.closed_trades)
+
+    def _handle_position_open(self, signal, position):
+        """Bookkeeping when a new position is opened."""
+        logger.info(
+            "✅ Position opened: %s %s @ %.4f (qty %.2f, margin $%.2f)",
+            position.side,
+            position.symbol,
+            position.entry_price,
+            position.size,
+            position.margin_usdt,
         )
-        self.bot._safe_gui_call(self.bot.gui.add_event, event_text, 
-                               'success' if closed_trade.pnl > 0 else 'error')
+
+        if self.bot.gui and hasattr(self.bot.gui, "activity_log"):
+            payload = {
+                "side": position.side,
+                "entry_price": position.entry_price,
+                "stop_loss": position.stop_loss,
+                "take_profit": position.take_profit_1,
+                "risk_percent": self.bot.config["risk"].get("base_risk_percent", 0.0),
+                "leverage": position.leverage,
+            }
+            self.bot._safe_gui_call(self.bot.gui.activity_log.add_position_opened, signal.symbol, payload)
+
+        self.bot._update_gui()
     
     async def _analyze_signals(self):
-        """Analyse signals for every pair."""
-        # Check if paused (Авто ВЫКЛ)
-        if self.bot.paused:
-            return
-        
-        all_signals = []
-        processed = 0
-        
+        """Analyse signals for every pair (stage 1 rebuild)."""
+        all_signals: List = []
+        self.bot.current_signals = {}
+
         for symbol in self.bot.pairs:
             try:
                 orderbook = self.bot.binance_client.get_orderbook(symbol)
-                window_seconds = self.bot.config['signals'].get('tape_window_seconds', 20)
-                recent_trades = self.bot.binance_client.get_recent_trades(
-                    symbol, 500, max(60, window_seconds)
-                )
-                
-                if not orderbook.get('bids') or not orderbook.get('asks') or \
-                   not orderbook['bids'] or not orderbook['asks']:
-                    logger.debug(f"⏸️ {symbol}: empty order book")
-                    continue
-                
-                processed += 1
-                
-                # Analyse signal
+                recent_trades: List[Dict] = self.bot.binance_client.get_recent_trades(symbol)
+
                 signal = self.bot.signal_analyzer.analyze(symbol, orderbook, recent_trades)
                 self.bot.current_signals[symbol] = signal
-                
-                # Use default parameters (adaptive learning removed)
-                adaptive_params = {
-                    'min_confidence': self.bot.config['signals']['min_confidence'],
-                    'position_size_multiplier': 1.0,
-                    'leverage_multiplier': 1.0
-                }
-                strictness_params = self._get_strictness_params()
-                
-                # Determine minimum confidence threshold
-                if self.bot.strictness_percent > 75:
-                    min_conf = strictness_params['min_confidence']
-                else:
-                    min_conf = max(adaptive_params['min_confidence'], 
-                                 strictness_params['min_confidence'])
-                
-                if signal.direction in ['LONG', 'SHORT']:
-                    if signal.confidence < min_conf:
-                        logger.info(
-                            f"⏸️ {symbol}: {signal.direction} - "
-                            f"confidence={signal.confidence:.1f}% < {min_conf:.1f}% "
-                            f"(min, strictness={self.bot.strictness_percent:.0f}%)"
-                        )
-                
-                if signal.direction in ['LONG', 'SHORT'] and signal.confidence >= min_conf:
-                    trades_required = self._calculate_trades_required(signal, strictness_params)
-                    
-                    if len(recent_trades) < trades_required:
-                        logger.info(
-                            f"⏸️ {symbol}: not enough trades "
-                            f"({len(recent_trades)} < {trades_required}, "
-                            f"strictness={self.bot.strictness_percent:.0f}%)"
-                        )
-                        continue
-                    
-                    # Ensure there is no open position already
-                    if symbol not in self.bot.paper_trader.positions:
-                        # Calculate priority
-                        expected_profit_percent = abs(
-                            signal.take_profit_1 - signal.entry_price
-                        ) / signal.entry_price
-                        priority_score = signal.confidence * expected_profit_percent * 100
-                        
-                        all_signals.append({
-                            'signal': signal,
-                            'orderbook': orderbook,
-                            'priority': priority_score,
-                            'recent_trades': len(recent_trades),
-                            'adaptive_params': adaptive_params
-                        })
-            
-            except Exception as e:
-                logger.error(f"Signal analysis failed for {symbol}: {e}")
-                continue
-        
-        logger.debug(f"📊 Processed {processed}/{len(self.bot.pairs)} pairs, signals: {len(all_signals)}")
+                all_signals.append(signal)
+            except Exception as exc:
+                logger.error("Signal analysis failed for %s: %s", symbol, exc)
+
         return all_signals
     
     async def _open_best_positions(self, all_signals):
-        """Open top-priority positions."""
-        all_signals.sort(key=lambda x: x['priority'], reverse=True)
-        
-        max_positions = self.bot.config['account']['max_positions']
-        current_positions = len(self.bot.paper_trader.positions)
-        
-        for signal_data in all_signals:
-            if current_positions >= max_positions:
-                break
-            
-            signal = signal_data['signal']
-            
-            # Fetch current order book
-            if signal.confidence >= 90:
-                orderbook = signal_data.get('orderbook')
-            else:
-                orderbook = self.bot.binance_client.get_orderbook(signal.symbol)
-            
-            if not orderbook or not orderbook.get('bids') or not orderbook.get('asks'):
-                logger.debug(f"⏸️ {signal.symbol}: no up-to-date order book")
+        """Stage 1 entry logic – open every non-WAIT signal."""
+        if not all_signals:
+            return
+
+        for signal in all_signals:
+            if getattr(signal, "direction", "WAIT") == "WAIT":
                 continue
-            
-            # Validate price change tolerance
-            if self.bot.strictness_percent <= 75 and signal.confidence < 90:
-                current_price = self.bot.binance_client.get_current_price(signal.symbol)
-                if current_price == 0:
-                    continue
-                
-                strictness_params = self._get_strictness_params()
-                price_diff = abs(current_price - signal.entry_price) / signal.entry_price
-                if price_diff > strictness_params['max_price_diff']:
-                    logger.debug(
-                        f"⏸️ {signal.symbol}: price moved {price_diff*100:.2f}% > "
-                        f"{strictness_params['max_price_diff']*100:.2f}%, skipping"
-                    )
-                    continue
-            
-            # Open the position
-            adaptive_params = signal_data.get('adaptive_params', {})
-            position = self.bot.paper_trader.open_position(signal, orderbook, adaptive_params)
-            
+
+            orderbook = self.bot.binance_client.get_orderbook(signal.symbol)
+            position = self.bot.paper_trader.open_position(signal, orderbook)
             if position:
-                current_positions += 1
-                logger.info(
-                    f"{'🟢' if position.side == 'LONG' else '🔴'} "
-                    f"Opened {position.symbol} {position.side}: "
-                    f"${position.entry_price:.2f} (leverage: {position.leverage}x, "
-                    f"confidence: {signal.confidence:.1f}%, "
-                    f"priority: {signal_data['priority']:.1f})"
-                )
+                self._handle_position_open(signal, position)
     
     def _log_statistics(self):
         """Log trading statistics and handle autosave."""
