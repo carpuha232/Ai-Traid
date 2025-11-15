@@ -216,6 +216,27 @@ class AutoScalpingBot:
             return self.live_account_overview.get('unrealizedProfit', 0.0)
         return self.paper_trader.balance - self.paper_trader.starting_balance
     
+    def _calculate_margin_usage_percent(self) -> float:
+        """Процент задействованной маржи для отображения в GUI."""
+        snapshot = self.live_account_overview or {}
+        wallet_balance = float(snapshot.get('walletBalance', 0.0) or 0.0)
+        initial_margin = float(snapshot.get('initialMargin', snapshot.get('totalInitialMargin', 0.0)) or 0.0)
+        if wallet_balance > 0 and initial_margin >= 0:
+            return max(0.0, min((initial_margin / wallet_balance) * 100.0, 999.9))
+        
+        total_margin = 0.0
+        for pos in self.paper_trader.positions.values():
+            margin = float(getattr(pos, 'margin_usdt', 0.0) or 0.0)
+            if margin <= 0:
+                entry = float(getattr(pos, 'entry_price', 0.0))
+                size = float(getattr(pos, 'size', 0.0))
+                leverage = float(getattr(pos, 'leverage', self.paper_trader.leverage or 1) or 1)
+                margin = (entry * size / leverage) if leverage else 0.0
+            total_margin += max(margin, 0.0)
+        
+        wallet = float(self.paper_trader.balance or self.paper_trader.starting_balance or 0.0)
+        return (total_margin / wallet * 100.0) if wallet > 0 else 0.0
+    
     def close_position(self, symbol: str, order_type: str = 'Manual'):
         """Close a specific position via GUI."""
         if symbol in self.paper_trader.positions:
@@ -227,8 +248,8 @@ class AutoScalpingBot:
                 )
                 if closed_trade:
                     logger.info(f"🔹 Closed position {symbol} manually ({order_type})")
-                    return True
-        return False
+                    return closed_trade
+        return None
     
     def close_all_positions(self):
         """Close all open positions (emergency)."""
@@ -268,41 +289,17 @@ class AutoScalpingBot:
     def _on_close_position_requested(self, symbol: str):
         """Handle close position button click from GUI."""
         logger.info(f"🔴 Manual close requested for {symbol}")
-        
-        # Get position data before closing
-        if symbol in self.paper_trader.positions:
-            position = self.paper_trader.positions[symbol]
-            raw_symbol = symbol.split('|')[0]
-            current_price = self.binance_client.get_current_price(raw_symbol)
-            
-            # Calculate PNL before closing
-            if position.side == 'LONG':
-                pnl = (current_price - position.entry_price) * position.size
-            else:
-                pnl = (position.entry_price - current_price) * position.size
-            
-            pnl_percent = (pnl / (position.entry_price * position.size / position.leverage)) * 100
-            
-            # Close position
-            success = self.close_position(symbol, 'Manual Close')
-            if success:
-                # Add to activity log
-                if self.gui and hasattr(self.gui, 'activity_log'):
-                    try:
-                        self.gui.activity_log.add_position_closed(symbol, {
-                            'pnl': pnl,
-                            'pnl_percent': pnl_percent,
-                            'reason': 'Manual Close'
-                        })
-                    except (RuntimeError, AttributeError) as e:
-                        logger.debug(f"Activity log update failed: {e}")
-                
-                # Update GUI after closing position
-                self._update_gui()
-            else:
-                logger.warning(f"⚠️ Failed to close position {symbol}")
-        else:
-            logger.warning(f"⚠️ Position {symbol} not found")
+
+        if not self.running or not self._loop:
+            closed_trade = self.close_position(symbol, 'Manual Close')
+            self._handle_manual_close_result(symbol, closed_trade)
+            return
+
+        future = asyncio.run_coroutine_threadsafe(
+            self._handle_manual_close(symbol),
+            self._loop,
+        )
+        future.add_done_callback(self._on_manual_close_finished)
 
     def _on_start_position_requested(self, symbol: str = ""):
         """Handle manual Start button click."""
@@ -335,6 +332,38 @@ class AutoScalpingBot:
         )
         self._update_gui()
         return result
+
+    async def _handle_manual_close(self, symbol: str):
+        closed_trade = await asyncio.to_thread(self.close_position, symbol, 'Manual Close')
+        return {"symbol": symbol, "trade": closed_trade}
+
+    def _on_manual_close_finished(self, future):
+        try:
+            payload = future.result()
+        except Exception as exc:
+            logger.error(f"❌ Manual close failed: {exc}", exc_info=True)
+            self._notify_status_bar(f"Ошибка закрытия позиции: {exc}")
+            return
+        symbol = payload.get("symbol")
+        closed_trade = payload.get("trade")
+        self._handle_manual_close_result(symbol, closed_trade)
+
+    def _handle_manual_close_result(self, symbol: str, closed_trade):
+        if closed_trade:
+            if self.gui and hasattr(self.gui, 'activity_log'):
+                try:
+                    self.gui.activity_log.add_position_closed(symbol, {
+                        'pnl': closed_trade.pnl,
+                        'pnl_percent': closed_trade.pnl_percent,
+                        'reason': 'Manual Close'
+                    })
+                except (RuntimeError, AttributeError) as e:
+                    logger.debug(f"Activity log update failed: {e}")
+            self._notify_status_bar("Позиция закрыта.")
+        else:
+            logger.warning(f"⚠️ Failed to close position {symbol}")
+            self._notify_status_bar("Не удалось закрыть позицию, см. логи.")
+        self._update_gui()
 
     def _on_manual_start_finished(self, future):
         """Callback after manual start completes."""
@@ -544,9 +573,11 @@ class AutoScalpingBot:
                         setattr(pos, 'liquidation_price', float(info.get('liquidationPrice', 0.0)))
                     if need_be and info:
                         setattr(pos, 'break_even_price', float(info.get('breakEvenPrice', pos.entry_price)))
+                margin_used_value = self._calculate_margin_usage_percent()
             else:
                 snapshot = self._maybe_refresh_live_account_overview()
                 if snapshot:
+                    self.live_account_overview = snapshot
                     balance_value = snapshot.get('walletBalance', self.paper_trader.balance)
                     pnl_value = snapshot.get('unrealizedProfit', 0.0)
                 else:
@@ -556,6 +587,7 @@ class AutoScalpingBot:
                 win_rate_value = stats['win_rate']
                 drawdown_value = self.paper_trader.max_drawdown
                 positions_count = len(self.paper_trader.positions)
+                margin_used_value = self._calculate_margin_usage_percent()
             
             self._safe_gui_call(
                 self.gui.update_account_signal,
@@ -563,6 +595,7 @@ class AutoScalpingBot:
                 pnl_value,
                 win_rate_value,
                 drawdown_value,
+                margin_used_value,
                 positions_count
             )
             
@@ -695,6 +728,7 @@ class AutoScalpingBot:
                 self._get_display_pnl_value(),  # pnl
                 stats['win_rate'],  # winrate
                 0.0,  # drawdown
+                self._calculate_margin_usage_percent(),  # margin used
                 0  # positions_count
             )
 

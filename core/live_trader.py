@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import math
 from datetime import datetime
 from time import time
 from typing import Any, Dict, List, Optional
@@ -37,10 +38,12 @@ class LiveTrader(PaperTrader):
     ):
         super().__init__(config, starting_balance)
         self.client = Client(api_key, api_secret)
+        self._refresh_symbol_rules_from_exchange()
         self.refresh_interval = max(0.5, float(refresh_interval))
         self._last_refresh_ts: float = 0.0
         self._last_time_sync_ts: float = 0.0
         self._leverage_cache: Dict[str, int] = {}
+        self._margin_mode_cache: Dict[str, str] = {}
         self._open_orders_map: Dict[int, Dict] = {}
         self._user_stream_task: Optional[asyncio.Task] = None
         self._user_keepalive_task: Optional[asyncio.Task] = None
@@ -51,6 +54,10 @@ class LiveTrader(PaperTrader):
         self.stream_refresh_min_interval: float = 2.0
         self.grid_orders_tracker: Dict[str, Dict[str, Any]] = {}
         self.take_profit_orders: Dict[str, int] = {}
+        self._averaging_watch_tasks: Dict[str, asyncio.Task] = {}
+        risk_cfg = config.get("risk", {})
+        self.averaging_emergency_multiplier = float(risk_cfg.get("averaging_emergency_multiplier", 0.4))
+        self.averaging_watch_interval = max(0.2, float(risk_cfg.get("averaging_watch_interval", 0.8)))
 
         # Snapshots used by the GUI
         self.account_overview: Dict[str, float] = {
@@ -344,10 +351,19 @@ class LiveTrader(PaperTrader):
                 return
             tracker = self.grid_orders_tracker.get(symbol)
             if tracker and tracker.get("pending_order_id") == order_id:
-                tracker["level_index"] += 1
-                tracker["pending_order_id"] = None
-                loop = asyncio.get_running_loop()
-                loop.create_task(self._spawn_next_averaging(symbol, tracker))
+                qty = float(
+                    simplified.get("origQty")
+                    or simplified.get("executedQty")
+                    or tracker.get("pending_order_qty")
+                    or 0.0
+                )
+                price = float(
+                    simplified.get("avgPrice")
+                    or simplified.get("price")
+                    or tracker.get("pending_order_price")
+                    or 0.0
+                )
+                self._handle_averaging_fill(symbol, tracker, qty, price)
 
     async def _refresh_from_stream_snapshot(self):
         now = time()
@@ -390,13 +406,14 @@ class LiveTrader(PaperTrader):
             logger.warning("⚠️ LiveTrader: no entry price for %s", symbol)
             return None
 
-        quantity = self._calculate_min_quantity(entry_price, rules)
+        quantity = self._calculate_min_quantity(entry_price, rules, buffer_multiplier=self.first_entry_buffer)
         if quantity <= 0:
             logger.warning("⚠️ LiveTrader: could not compute quantity for %s", symbol)
             return None
 
         try:
             self._sync_server_time()
+            self._ensure_isolated_margin(symbol)
             self._ensure_symbol_leverage(symbol)
             order = self.client.futures_create_order(
                 symbol=symbol,
@@ -471,11 +488,12 @@ class LiveTrader(PaperTrader):
         mark_payload = self.client.futures_mark_price(symbol=symbol)
         entry_price = float(mark_payload.get("markPrice", 0.0)) if mark_payload else 0.0
 
-        quantity = self._calculate_min_quantity(entry_price, rules)
+        quantity = self._calculate_min_quantity(entry_price, rules, buffer_multiplier=self.first_entry_buffer)
         if quantity <= 0:
             raise ValueError(f"Could not compute quantity for {symbol}")
 
         self._sync_server_time()
+        self._ensure_isolated_margin(symbol)
         self._ensure_symbol_leverage(symbol)
 
         try:
@@ -520,6 +538,11 @@ class LiveTrader(PaperTrader):
         pending_order = self._place_next_averaging_order(symbol, tracker, buffer_ratio)
         if pending_order is None:
             self.grid_orders_tracker.pop(symbol, None)
+        else:
+            tracker["pending_order_id"] = pending_order.get("orderId")
+            tracker["pending_order_qty"] = pending_order.get("quantity")
+            tracker["pending_order_price"] = pending_order.get("price")
+            self._restart_averaging_watchdog(symbol)
         take_order = self._place_take_profit_order(symbol)
 
         self.refresh_from_exchange(force=True)
@@ -548,6 +571,7 @@ class LiveTrader(PaperTrader):
         qty = round(position.size, 8)
         side = "SELL" if position.side == "LONG" else "BUY"
 
+        order = None
         try:
             self._sync_server_time()
             order = self.client.futures_create_order(
@@ -562,6 +586,9 @@ class LiveTrader(PaperTrader):
             logger.info("LiveTrader: MARKET %s to close %s (qty %.4f)", side, position_key, qty)
         except BinanceAPIException as exc:
             logger.error("LiveTrader: close position failed for %s: %s", position_key, exc)
+            return None
+        except Exception as exc:
+            logger.error("LiveTrader: unexpected error while closing %s: %s", position_key, exc, exc_info=True)
         return None
 
         avg_price = float(order.get("avgPrice") or order.get("price") or exit_price or position.entry_price)
@@ -627,6 +654,25 @@ class LiveTrader(PaperTrader):
             logger.info("LiveTrader: leverage %dx applied to %s", target, symbol)
         except BinanceAPIException as exc:
             logger.warning("LiveTrader: unable to set leverage for %s: %s", symbol, exc)
+    
+    def _ensure_isolated_margin(self, symbol: str, margin_type: str = "ISOLATED"):
+        current = self._margin_mode_cache.get(symbol)
+        if current == margin_type:
+            return
+        try:
+            self.client.futures_change_margin_type(
+                symbol=symbol,
+                marginType=margin_type,
+                recvWindow=10000,
+            )
+            self._margin_mode_cache[symbol] = margin_type
+            logger.info("LiveTrader: margin mode %s applied to %s", margin_type, symbol)
+        except BinanceAPIException as exc:
+            if exc.code in (-4046,):  # margin type already set
+                self._margin_mode_cache[symbol] = margin_type
+                logger.debug("LiveTrader: %s already in %s margin mode", symbol, margin_type)
+                return
+            logger.warning("LiveTrader: unable to set margin mode for %s: %s", symbol, exc)
 
     def _place_next_averaging_order(self, symbol: str, tracker: Dict[str, Any], buffer_ratio: float = 0.001) -> Optional[Dict[str, Any]]:
         tracker.setdefault("buffer_ratio", buffer_ratio)
@@ -655,7 +701,12 @@ class LiveTrader(PaperTrader):
                 liq_price = entry_price * (1 + (0.99 / leverage))
 
         if liq_price <= 0:
-            logger.warning("LiveTrader: no liquidation price for %s", symbol)
+            logger.warning(
+                "LiveTrader: no liquidation price for %s (entry %.6f, leverage %.2f)",
+                symbol,
+                entry_price,
+                position.leverage or self.leverage,
+            )
             return None
 
         rules_tick = float(rules.get("tick_size", 0.0001) or 0.0001)
@@ -665,11 +716,34 @@ class LiveTrader(PaperTrader):
 
         level_idx = tracker.get("level_index", 1)
         base_qty = tracker.get("base_qty", position.size)
-        if level_idx <= 2:
+        logger.debug(
+            "LiveTrader: preparing averaging L%d for %s (base %.4f, buffer %.5f, liq %.6f)",
+            level_idx,
+            symbol,
+            base_qty,
+            tracker["buffer_ratio"],
+            liq_price,
+        )
+
+        current_size = position.size
+        if position_info:
+            pos_amt = abs(float(position_info.get("positionAmt", current_size) or current_size))
+            if pos_amt > 0:
+                current_size = pos_amt
+                position.size = current_size
+
+        if level_idx <= 1:
             qty = base_qty
+        elif level_idx == 2:
+            qty = base_qty * 1.05
         else:
-            qty = max(position.size, base_qty)
+            qty = current_size * 2.0
+
         qty = max(qty, self._calculate_min_quantity(desired_price, rules))
+        step = float(rules.get("step_size", 0.0) or 0.0)
+        if step > 0:
+            steps = math.ceil(qty / step)
+            qty = round(steps * step, 8)
 
         try:
             self._sync_server_time()
@@ -688,9 +762,15 @@ class LiveTrader(PaperTrader):
             return None
 
         order_id = order.get("orderId")
-        tracker["pending_order_id"] = order_id
+        if order_id is None:
+            logger.error("LiveTrader: averaging order response missing orderId for %s", symbol)
+            return None
+        order_id_int = int(order_id)
+        tracker["pending_order_id"] = order_id_int
+        tracker["pending_order_qty"] = qty
+        tracker["pending_order_price"] = desired_price
         simplified = {
-            "orderId": order_id,
+            "orderId": order_id_int,
             "symbol": symbol,
             "side": "BUY",
             "type": "LIMIT",
@@ -699,11 +779,11 @@ class LiveTrader(PaperTrader):
             "executedQty": 0.0,
             "status": "NEW",
         }
-        self._open_orders_map[int(order_id)] = simplified
+        self._open_orders_map[order_id_int] = simplified
         self.open_orders = list(self._open_orders_map.values())
 
         order_info = {
-            "orderId": order_id,
+            "orderId": order_id_int,
             "price": desired_price,
             "quantity": qty,
             "level": level_idx,
@@ -805,10 +885,158 @@ class LiveTrader(PaperTrader):
         return {"orderId": order_id, "price": take_price}
 
     async def _spawn_next_averaging(self, symbol: str, tracker: Dict[str, Any]):
-        result = await asyncio.to_thread(self._place_next_averaging_order, symbol, tracker)
-        if result is None:
-            self.grid_orders_tracker.pop(symbol, None)
+        position_key = self._make_key(symbol, "LONG")
+        attempt = 0
+
+        # Always refresh take-profit after each filled averaging
         self._place_take_profit_order(symbol)
+
+        while position_key in self.positions:
+            try:
+                result = await asyncio.to_thread(self._place_next_averaging_order, symbol, tracker)
+            except Exception as exc:
+                attempt += 1
+                logger.error(
+                    "LiveTrader: exception while placing next averaging for %s (attempt %d): %s",
+                    symbol,
+                    attempt,
+                    exc,
+                )
+                result = None
+            if result is not None:
+                logger.info(
+                    "LiveTrader: placed next averaging L%d for %s (price %.6f qty %.4f)",
+                    result.get("level"),
+                    symbol,
+                    result.get("price"),
+                    result.get("quantity"),
+                )
+                self._place_take_profit_order(symbol)
+                self._restart_averaging_watchdog(symbol)
+                return
+
+            attempt += 1
+            logger.warning(
+                "LiveTrader: failed to place next averaging for %s (attempt %d), retrying...",
+                symbol,
+                attempt,
+            )
+            await asyncio.sleep(min(5, attempt))
+
+        logger.info("LiveTrader: position for %s closed before placing next averaging. Clearing tracker.", symbol)
+        self.grid_orders_tracker.pop(symbol, None)
+        self._stop_averaging_watchdog(symbol)
+
+    def _handle_averaging_fill(self, symbol: str, tracker: Dict[str, Any], qty: float, price: float):
+        current_level = tracker.get("level_index", 1)
+        logger.info(
+            "LiveTrader: averaging order filled L%d for %s qty %.4f price %.6f",
+            current_level,
+            symbol,
+            qty,
+            price,
+        )
+        tracker["level_index"] = current_level + 1
+        tracker["pending_order_id"] = None
+        tracker.pop("pending_order_qty", None)
+        tracker.pop("pending_order_price", None)
+        self._stop_averaging_watchdog(symbol)
+        loop = asyncio.get_running_loop()
+        loop.create_task(self._spawn_next_averaging(symbol, tracker))
+
+    def start_averaging_watchdog(self, symbol: str):
+        self._restart_averaging_watchdog(symbol)
+
+    def _restart_averaging_watchdog(self, symbol: str):
+        self._stop_averaging_watchdog(symbol)
+        tracker = self.grid_orders_tracker.get(symbol)
+        if not tracker or not tracker.get("pending_order_id"):
+            return
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        self._averaging_watch_tasks[symbol] = loop.create_task(self._averaging_watchdog(symbol))
+
+    def _stop_averaging_watchdog(self, symbol: str):
+        task = self._averaging_watch_tasks.pop(symbol, None)
+        if task and not task.done():
+            task.cancel()
+
+    async def _averaging_watchdog(self, symbol: str):
+        try:
+            while True:
+                tracker = self.grid_orders_tracker.get(symbol)
+                if not tracker or not tracker.get("pending_order_id"):
+                    break
+                position = self.positions.get(self._make_key(symbol, "LONG"))
+                if not position:
+                    break
+                liq_price = float(getattr(position, "liquidation_price", 0.0) or 0.0)
+                if liq_price <= 0:
+                    await asyncio.sleep(self.averaging_watch_interval)
+                    continue
+                mark_payload = await asyncio.to_thread(self.client.futures_mark_price, symbol=symbol)
+                mark_price = float(mark_payload.get("markPrice", 0.0)) if mark_payload else 0.0
+                if mark_price <= 0:
+                    await asyncio.sleep(self.averaging_watch_interval)
+                    continue
+                buffer_ratio = tracker.get("buffer_ratio", 0.001)
+                emergency_ratio = buffer_ratio * self.averaging_emergency_multiplier
+                if mark_price <= liq_price * (1 + emergency_ratio):
+                    logger.warning(
+                        "LiveTrader: forcing market averaging for %s (mark %.6f, liq %.6f)",
+                        symbol,
+                        mark_price,
+                        liq_price,
+                    )
+                    result = await asyncio.to_thread(self._force_market_averaging_sync, symbol)
+                    if result:
+                        tracker = self.grid_orders_tracker.get(symbol)
+                        if tracker:
+                            tracker["pending_order_id"] = None
+                            tracker.pop("pending_order_qty", None)
+                            tracker.pop("pending_order_price", None)
+                            self._handle_averaging_fill(symbol, tracker, result["qty"], result["avg_price"])
+                    break
+                await asyncio.sleep(self.averaging_watch_interval)
+        except asyncio.CancelledError:
+            pass
+        finally:
+            task = self._averaging_watch_tasks.get(symbol)
+            current = asyncio.current_task()
+            if task is current:
+                self._averaging_watch_tasks.pop(symbol, None)
+
+    def _force_market_averaging_sync(self, symbol: str) -> Optional[Dict[str, float]]:
+        tracker = self.grid_orders_tracker.get(symbol)
+        if not tracker:
+            return None
+        order_id = tracker.get("pending_order_id")
+        qty = tracker.get("pending_order_qty")
+        if not order_id or not qty:
+            return None
+        try:
+            self.client.futures_cancel_order(symbol=symbol, orderId=order_id)
+        except BinanceAPIException as exc:
+            if "Unknown order" not in str(exc):
+                logger.warning("LiveTrader: failed to cancel averaging %s order %s: %s", symbol, order_id, exc)
+        try:
+            self._sync_server_time()
+            order = self.client.futures_create_order(
+                symbol=symbol,
+                side="BUY",
+                type="MARKET",
+                quantity=qty,
+                reduceOnly=False,
+                recvWindow=10000,
+                newOrderRespType="RESULT",
+            )
+        except BinanceAPIException as exc:
+            logger.error("LiveTrader: emergency market averaging failed for %s: %s", symbol, exc)
+            return None
+        avg_price = float(order.get("avgPrice") or order.get("price") or 0.0)
+        return {"qty": qty, "avg_price": avg_price}
 
     def _fetch_position_info(self, symbol: str) -> Dict[str, Any]:
         try:
@@ -829,6 +1057,71 @@ class LiveTrader(PaperTrader):
                     self._last_position_info[symbol] = payload
         except Exception:
             pass
+
+    def _refresh_symbol_rules_from_exchange(self):
+        """Fetch precise minQty/minNotional info from Binance Futures for our symbols."""
+        fallback_rules = self.config.get("exchange_rules", {})
+        merged_rules = {symbol: rules.copy() for symbol, rules in fallback_rules.items()}
+
+        try:
+            info = self.client.futures_exchange_info()
+            symbols_meta = {
+                item.get("symbol"): item for item in info.get("symbols", [])
+            }
+            updated = []
+            for symbol, rules in merged_rules.items():
+                meta = symbols_meta.get(symbol)
+                if not meta:
+                    continue
+                filters = {f.get("filterType"): f for f in meta.get("filters", [])}
+                lot = filters.get("LOT_SIZE", {})
+                price_filter = filters.get("PRICE_FILTER", {})
+                min_notional_filter = filters.get("MIN_NOTIONAL", {})
+
+                min_qty = float(lot.get("minQty", rules.get("min_qty", 0.0)))
+                step = float(lot.get("stepSize", rules.get("step_size", 0.0)))
+                min_notional = float(min_notional_filter.get("notional", rules.get("min_notional", 0.0)))
+                tick = float(price_filter.get("tickSize", rules.get("tick_size", 0.0)))
+                buffer = float(rules.get("min_notional_buffer", 1.05))
+
+                merged_rules[symbol] = {
+                    "min_qty": min_qty,
+                    "step_size": step,
+                    "min_notional": min_notional,
+                    "tick_size": tick,
+                    "min_notional_buffer": buffer,
+                }
+                updated.append(f"{symbol}: minQty={min_qty} minNotional={min_notional}")
+
+            if updated:
+                logger.info("LiveTrader: symbol rules refreshed -> %s", "; ".join(updated))
+            self.symbol_rules = merged_rules
+            self._log_min_entry_requirements()
+        except Exception as exc:
+            logger.warning("LiveTrader: failed to refresh symbol rules from exchange: %s", exc)
+            if merged_rules:
+                self.symbol_rules = merged_rules
+                self._log_min_entry_requirements()
+
+    def _log_min_entry_requirements(self):
+        try:
+            lines = []
+            for symbol, rules in self.symbol_rules.items():
+                try:
+                    mark_payload = self.client.futures_mark_price(symbol=symbol)
+                except Exception:
+                    mark_payload = None
+                price = float(mark_payload.get("markPrice", 0.0)) if mark_payload else 0.0
+                if price <= 0:
+                    continue
+                qty = self._calculate_min_quantity(price, rules, buffer_multiplier=self.first_entry_buffer)
+                notional = qty * price
+                margin = notional / self.leverage if self.leverage else 0.0
+                lines.append(f"{symbol}: qty~{qty:.4f} (~${notional:.2f}, margin ${margin:.3f})")
+            if lines:
+                logger.info("LiveTrader: min entry @%dx -> %s", self.leverage, " | ".join(lines))
+        except Exception as exc:
+            logger.debug("LiveTrader: failed to log min entry requirements: %s", exc)
 
     @staticmethod
     def _align_price(price: float, tick_size: float) -> float:
@@ -854,6 +1147,7 @@ class LiveTrader(PaperTrader):
                 self._open_orders_map.pop(order_id, None)
         self.open_orders = list(self._open_orders_map.values())
         self._cancel_take_profit_order(symbol)
+        self._stop_averaging_watchdog(symbol)
 
     def _cancel_take_profit_order(self, symbol: str):
         order_id = self.take_profit_orders.pop(symbol, None)

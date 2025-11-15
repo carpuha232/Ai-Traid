@@ -27,7 +27,7 @@ from .widgets import (
 
 class TradingPrototype(QtWidgets.QMainWindow):
     # Signals for thread-safe updates
-    update_account_signal = QtCore.Signal(float, float, float, float, int)
+    update_account_signal = QtCore.Signal(float, float, float, float, float, int)
     update_signals_signal = QtCore.Signal(dict)
     update_positions_signal = QtCore.Signal(dict, dict)
     update_history_signal = QtCore.Signal(list)
@@ -602,14 +602,11 @@ class TradingPrototype(QtWidgets.QMainWindow):
         """Handle close button click - called directly from button."""
         self.positions_widget.closePositionRequested.emit(symbol)
     
-    def update_account_data(self, balance: float, pnl: float, winrate: float, drawdown: float, positions_count: int):
+    def update_account_data(self, balance: float, pnl: float, winrate: float, drawdown: float, margin_used: float, positions_count: int):
         """Update account metrics in control panel."""
         self.control_panel.update_balance(balance)
         self.control_panel.update_pnl(pnl)
         self.control_panel.update_winrate(winrate)
-        
-        # Calculate margin used (mock for now)
-        margin_used = (positions_count / 10) * 100  # Assuming max 10 positions
         self.control_panel.update_risk_metrics(margin_used, drawdown, positions_count)
     
     def update_signals_data(self, signals: dict):

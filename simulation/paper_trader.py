@@ -77,6 +77,11 @@ class PaperTrader:
         self.max_drawdown = 0.0
         self.symbol_rules = config.get("exchange_rules", {})
         self._validate_symbol_rules()
+        risk_cfg = config.get("risk", {})
+        self.default_notional_buffer = float(risk_cfg.get("min_notional_buffer", 1.05))
+        self.first_entry_buffer = float(risk_cfg.get("first_entry_buffer", 1.01))
+        self.averaging_emergency_multiplier = float(risk_cfg.get("averaging_emergency_multiplier", 0.4))
+        self.averaging_watch_interval = max(0.2, float(risk_cfg.get("averaging_watch_interval", 0.8)))
         logger.info("💰 Paper trader initialised (logic removed).")
 
     # ------------------------------------------------------------------ #
@@ -139,7 +144,7 @@ class PaperTrader:
             logger.warning("⚠️ No valid price to enter %s", symbol)
             return None
 
-        quantity = self._calculate_min_quantity(entry_price, rules)
+        quantity = self._calculate_min_quantity(entry_price, rules, buffer_multiplier=self.first_entry_buffer)
         if quantity <= 0:
             logger.warning("⚠️ Could not compute valid quantity for %s", symbol)
             return None
@@ -290,16 +295,18 @@ class PaperTrader:
         # Fallback to signal entry price if available
         return getattr(signal, "entry_price", 0.0) or 0.0
 
-    @staticmethod
-    def _calculate_min_quantity(price: float, rules: Dict[str, float]) -> float:
+    def _calculate_min_quantity(self, price: float, rules: Dict[str, float], buffer_multiplier: Optional[float] = None) -> float:
         min_qty = float(rules.get("min_qty", 0.0))
         step = float(rules.get("step_size", 0.0))
         min_notional = float(rules.get("min_notional", 0.0))
+        buffer = buffer_multiplier if buffer_multiplier is not None else float(rules.get("min_notional_buffer", self.default_notional_buffer))
 
         if price <= 0 or min_qty <= 0 or step <= 0:
             return 0.0
 
-        qty = max(min_qty, min_notional / price if min_notional else min_qty)
+        target_notional = min_notional * buffer if min_notional else 0.0
+        buffered_qty = (target_notional / price) if target_notional else 0.0
+        qty = max(min_qty, buffered_qty)
         # align to step size upwards to satisfy notional
         steps = math.ceil(qty / step)
         return round(steps * step, 8)
